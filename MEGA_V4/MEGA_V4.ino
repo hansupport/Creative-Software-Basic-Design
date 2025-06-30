@@ -6,37 +6,65 @@
 #include <RtcDS1302.h>           // RTC DS1302 라이브러리
 #include <SD.h>                  // SD 카드 라이브러리
 
-// —————— 전역 변수 ——————
-bool systemActive = false;           // 시스템 동작 상태
-unsigned long activeStart = 0;       // 마지막 활성화 시각
-const unsigned long activeTimeout = 10000;  // 10초 동작 지속 시간
-
 // —————— 핀 정의 ——————
-#define RST_PIN     14           // RFID RST 핀
-#define SS_PIN      15           // RFID SS (SDA)
-#define IR_SENSOR_PIN 16         // IR 장애물 감지 센서 핀
 
-// 키패드 행(Row)과 열(Col) 핀 정의
-const uint8_t rowPins[4] = {5,4,3,2};
-const uint8_t colPins[4] = {6,7,8,9};
+// 키패드 행과 열 핀 정의
+const uint8_t rowPins[4] = {29, 28, 27, 26};   // R1~R4
+const uint8_t colPins[4] = {30, 31, 32, 33};   // C1~C4
 
-// LCD 디스플레이 설정 (I2C 주소 및 크기)
+// LCD I2C 핀은 별도 설정 없음 (I2C 주소 기반)
 #define LCD_ADDR    0x27
 #define LCD_COLS    16
 #define LCD_ROWS    2
 
 // RTC 핀 정의
-#define RTC_RST_PIN 10
-#define RTC_CLK_PIN 11
-#define RTC_DAT_PIN 12
+#define RTC_RST_PIN 24
+#define RTC_CLK_PIN 22
+#define RTC_DAT_PIN 23
 
-// 택트 스위치 핀 정의
-#define WAKE_BUTTON_PIN 17
+// RFID 핀 정의
+#define RST_PIN     11  // RST
+#define SS_PIN      10  // SDA
+// SCK, MOSI, MISO는 SPI 핀 (52, 51, 50)
+
+// SD카드 CS 핀 정의
+#define SD_CS_PIN   53  // SPI CS
+// SPI 핀 공유: SCK 52, MOSI 51, MISO 50
 
 // 조이스틱 핀 정의
-#define SW 13                           // 조이스틱 클릭 스위치 핀                       
-#define VRX A14                         // 조이스틱 X축 (미사용)
-#define VRY A15                         // 조이스틱 Y축 (위/아래 스크롤용)
+#define VRX A0
+#define VRY A1
+#define SW  -1   // 미사용
+
+// IR 장애물 센서 핀 정의
+#define IR_SENSOR_PIN 12 
+
+// 택트 스위치 핀 정의
+#define WAKE_BUTTON_PIN 13
+
+// RGB LED 핀 정의
+#define RGB_PIN_R 7
+#define RGB_PIN_G 8
+#define RGB_PIN_B 9
+
+// 로터리 엔코더 핀 정의
+#define ROTARY_CLK 3
+#define ROTARY_DT  2
+#define ROTARY_SW  -1   // 미사용
+
+// IR 리시버 핀 정의
+#define IR_RECV_PIN 6
+
+// 시프트 레지스터 핀
+#define DATA_PIN 36   // DS
+#define LATCH_PIN 35  // STCP
+#define CLOCK_PIN 34  // SHCP
+
+// 부저 핀
+#define BUZZER_PIN 37
+
+// —————— 전역 변수 ——————
+// 조이스틱
 int joyY;                              // 현재 Y축 아날로그 값
 bool joyHolding = false;              // Y축을 계속 누르고 있는 중인지 여부
 unsigned long joyHoldStart = 0;       // 누르기 시작한 시간
@@ -46,9 +74,6 @@ const int joyFastThreshold = 1000;    // 1초 이상 유지 시 빠른 스크롤
 const int joyIntervalNormal = 500;    // 일반 속도 스크롤 간격 (ms)
 const int joyIntervalFast = 150;       // 빠른 속도 스크롤 간격 (ms)
 
-// SD카드 CS 핀 정의
-#define SD_CS_PIN   53
-
 // SD카드 폴더 경로 설정
 const char *SD_USERS_FOLDER       = "USERS";  // 사용자 정보 폴더
 const char *SD_COMMUTE_LOG_FOLDER = "LOG1";   // 출퇴근 로그 폴더
@@ -57,10 +82,56 @@ const char *SD_COMMUTE_LOG_FOLDER = "LOG1";   // 출퇴근 로그 폴더
 // 관리자 사번 지정
 const String adminCode = "22011949";
 
+// 절전 타이머
+bool systemActive = false;           // 시스템 동작 상태
+unsigned long activeStart = 0;       // 마지막 활성화 시각
+const unsigned long activeTimeout = 10000;  // 10초 동작 지속 시간
+
+// 밝기, 소리
+int brightness;     // LED 밝기 (0–30)
+int volumeLevel;    // 부저 소리 (0–30)
+
+// 로터리 엔코더
+int lastClkState;   // 상태 저장
+
+// 로터리 엔코더 디바운싱
+unsigned long lastEncoderDebounceTime = 0;
+const unsigned long encoderDebounceDelay = 5;  // 5ms
+volatile int encoderPos = 0;   // lastClkState: 이전 CLK 읽기값을 저장해 방향 판별 및 디바운싱에 사용
+volatile uint8_t lastState;       // 이전 2비트 상태: (DT<<1)|CLK
+volatile int8_t stepSum     = 0;   // 4스텝 누적용 버퍼
+
+// 비차단용 전역 상태 변수
+bool nbLedEnable  = false;
+bool nbBuzzEnable = false;
+
+unsigned long nbPrevLedMillis  = 0;
+unsigned long nbPrevBuzzMillis = 0;
+
+bool nbLedOnState    = false;   // LED 현재 ON/OFF 상태
+int  nbLedPattern    = 0;       // 패턴 토글용: 0=파랑, 1=빨강
+int  nbLedBlinkCount = 0;       // 깜빡임 횟수 카운트
+int nbLedCycleCount = 0;        // on-phase 카운트용 (3번마다 색 전환)
+
+bool nbBuzzOnState   = false;   // 부저 ON/OFF 상태 toggle
+int  nbToneStep      = 0;       // tone1(0) / tone2(1) 선택
+
+int  nbDutyOn, nbDutyOff;       // 감마 기반 ON/OFF 시간(ms)
+int  nbLedInterval;             // LED가 다음 전환까지 기다릴 시간
+int  nbBuzzInterval = 40;       // 부저가 다음 전환까지 기다릴 시간
+
+// 룩업 테이블: 인덱스 = (lastState<<2)|newState
+const int8_t QUAD_TABLE[16] = {
+   0, -1, +1,  0,
+  +1,  0,  0, -1,
+  -1,  0,  0, +1,
+   0, +1, -1,  0
+};
+
 // —————— 객체 선언 ——————
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);       // LCD 객체
 MFRC522 rfid(SS_PIN, RST_PIN);                             // RFID 객체
-ThreeWire myWire(RTC_CLK_PIN, RTC_DAT_PIN, RTC_RST_PIN);   // RTC 통신 설정
+ThreeWire myWire(RTC_DAT_PIN, RTC_CLK_PIN, RTC_RST_PIN);   // RTC 통신 설정
 RtcDS1302<ThreeWire> Rtc(myWire);                          // RTC 객체
 
 // 키패드 키 배열 정의
@@ -118,11 +189,11 @@ int getNavScroll(int current, int total, bool &updated) {
       joyHolding = true;
       joyHoldStart = now;
       lastJoyScroll = now;
-      dir = (joyY < 400) ? -1 : 1;       // 위쪽: 다음, 아래쪽: 이전
+      dir = (joyY < 400) ? 1 : -1;       // 위쪽: 다음, 아래쪽: 이전
       updated = true;
     } else if (now - lastJoyScroll >= interval) {
       // 일정 시간 경과 후 반복 스크롤
-      dir = (joyY < 400) ? -1 : 1;
+      dir = (joyY < 400) ? 1 : -1;
       updated = true;
       lastJoyScroll = now;
     }
@@ -366,7 +437,6 @@ void registerOnSD(const String &uid, const String &num) {
 }
 
 // 출퇴근 로그를 날짜별 파일에 시간, ID, UID를 함께 기록
-// 출퇴근 로그를 날짜별 파일에 시간, ID, UID를 함께 기록 (logCommute 전체)
 void logCommute(const String &id, const String &uid) {
   RtcDateTime now = Rtc.GetDateTime();
 
@@ -411,7 +481,6 @@ void logCommute(const String &id, const String &uid) {
   digitalWrite(SD_CS_PIN, HIGH);  // SD카드 비활성화
 }
 
-
 // 날짜 로그 파일을 최신순으로 가져오는 함수
 String getCommuteFileAt_Desc(int idx) {
   char prevFile[13] = "";  // 이전에 찾은 파일명을 저장 (초기에는 빈 문자열)
@@ -447,7 +516,147 @@ String getCommuteFileAt_Desc(int idx) {
   return String(prevFile);  // idx번째 최신 파일명을 반환
 }
 
-// — 관리자 메뉴 & 서브메뉴 — 
+// 설정 불러오는 함수
+void loadSettings() {
+  File f = SD.open("SET/config.txt");
+  if (f) {
+    brightness = f.parseInt();
+    volumeLevel = f.parseInt();
+    f.close();
+  }
+}
+
+// 설정 저장하는 함수
+void saveSettings() {
+  // 기존 파일 삭제 → 새로 생성하며 쓰기
+  SD.remove("SET/config.txt");
+  File f = SD.open("SET/config.txt", FILE_WRITE);
+  if (f) {
+    f.print(brightness);
+    f.print(" ");
+    f.print(volumeLevel);
+    f.close();
+  }
+}
+
+// ledOn==true/BuzzerOn==true 로 콜하면 파랑→빨강 2회씩 깜빡이고,
+// 부저도 tone1/tone2 반복하며 울리기 시작
+void triggerLedAndBuzzer(bool ledOn, bool buzzerOn) {
+  nbLedEnable    = ledOn;
+  nbBuzzEnable   = buzzerOn;
+  nbPrevLedMillis  = millis();
+  nbPrevBuzzMillis = millis();
+
+  // LED: 깜빡임 시작 전 OFF 상태로 세팅하고, 다음 on-phase 패턴은 파랑으로
+  nbLedOnState    = false;
+  nbLedPattern    = 1;     // 첫 토글 시 !1 → 0(파랑)  
+  nbLedBlinkCount = 0;     // (더 이상 사용하지 않음)
+
+  // 부저: 무조건 OFF로 시작
+  nbBuzzOnState = false;
+  nbToneStep    = 0;
+
+  // 밝기 기반 감마 보정 초기 계산
+  float norm     = brightness / 30.0;
+  float adj      = pow(norm, 2.0);
+  nbDutyOn       = int(adj * 80.0 + 10.0);  // 10~90ms
+  nbDutyOff      = 100 - nbDutyOn;
+  nbLedInterval  = nbDutyOn;
+
+  // 부저 인터벌 초기화
+  nbBuzzInterval = 40;
+}
+
+// 매 프레임 호출할 업데이트 함수
+void updateLedAndBuzzer() {
+  unsigned long now = millis();
+  const unsigned long BUZZER_ON_TIME  = 100;  // 부저 ON 지속(ms)
+  const unsigned long BUZZER_OFF_TIME = 50;   // 부저 OFF 지속(ms)
+
+  // === LED 3회씩 파랑 ↔ 빨강 깜빡임 상태 머신 ===
+  if (nbLedEnable) {
+    if (brightness > 0) {
+      // [기존 깜빡임 로직 그대로 사용]
+      if (now - nbPrevLedMillis >= nbLedInterval) {
+        nbPrevLedMillis = now;
+        if (nbLedOnState) {
+          // on → off
+          nbLedOnState = false;
+          digitalWrite(LATCH_PIN, LOW);
+          shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0);
+          digitalWrite(LATCH_PIN, HIGH);
+          nbLedInterval = nbDutyOff;
+        } else {
+          // off → on
+          nbLedOnState = true;
+          byte pattern = nbLedPattern ? 0b11110000 : 0b00001111;
+          digitalWrite(LATCH_PIN, LOW);
+          shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, pattern);
+          digitalWrite(LATCH_PIN, HIGH);
+          nbLedInterval = nbDutyOn;
+          if (++nbLedCycleCount >= 3) {
+            nbLedCycleCount = 0;
+            nbLedPattern = 1 - nbLedPattern;
+          }
+        }
+      }
+    } else {
+      // brightness == 0 일 때는 무조건 LED 꺼두기
+      digitalWrite(LATCH_PIN, LOW);
+      shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0);
+      digitalWrite(LATCH_PIN, HIGH);
+    }
+  }
+
+  // === 부저 상태 머신 ===
+  if (nbBuzzEnable) {
+    if (volumeLevel > 0) {
+      if (now - nbPrevBuzzMillis >= nbBuzzInterval) {
+        nbPrevBuzzMillis = now;
+        if (nbBuzzOnState) {
+          noTone(BUZZER_PIN);
+          nbBuzzOnState  = false;
+          nbToneStep     = 1 - nbToneStep;
+          nbBuzzInterval = BUZZER_OFF_TIME;
+        } else {
+          int baseFreq = map(volumeLevel, 1, 30, 100, 2000);
+          tone(BUZZER_PIN, baseFreq + (nbToneStep ? 250 : 0));
+          nbBuzzOnState  = true;
+          nbBuzzInterval = BUZZER_ON_TIME;
+        }
+      }
+    } else {
+      // volumeLevel == 0 일 때 부저 완전 정지
+      noTone(BUZZER_PIN);
+    }
+  }
+}
+
+// 로터리 엔코더 디바운스 함수
+void onEncoderChange() {
+  static unsigned long lastMicros = 0;
+  unsigned long now = micros();
+  if (now - lastMicros < 2000) return;      // 2 ms 디바운스
+  lastMicros = now;
+
+  uint8_t newState = (digitalRead(ROTARY_DT) << 1) | digitalRead(ROTARY_CLK);
+  uint8_t idx      = (lastState << 2) | newState;
+  int8_t  delta    = QUAD_TABLE[idx];       // +1, -1, 또는 0
+
+  if (delta != 0) stepSum += delta;         // 유효 이동만 누적
+  lastState = newState;
+
+  /* 00(‘00’) 상태로 돌아왔을 때 4스텝 누적 값 확정
+     → 한 디텐트 당 +4 또는 -4 가 모여야 ±1 카운트 */
+  if (newState == 0) {
+    if (stepSum >= 3)      encoderPos++;    // 시계방향
+    else if (stepSum <= -3) encoderPos--;   // 반시계방향
+    stepSum = 0;                           // 버퍼 초기화
+  }
+}
+
+// —————— 관리자 메뉴 & 서브메뉴 ——————
+
 // 관리자 메뉴 1번 – 등록된 사용자 목록을 출력하고 개별/전체 삭제 기능 제공
 void menuUsers() {
   int total = countUsersOnSD();  // 전체 등록 사용자 수
@@ -457,8 +666,8 @@ void menuUsers() {
     return;
   }
 
-  int idx = 1;  // 현재 사용자 인덱스
-  int prevIdx = -1;  // 이전 인덱스 기억
+  int idx = 1;        // 현재 사용자 인덱스
+  int prevIdx = -1;   // 이전 인덱스 기억
   while (true) {
     // 1) 인덱스 변경 감지 시에만 화면 갱신
     if (idx != prevIdx) {
@@ -471,7 +680,7 @@ void menuUsers() {
 
     // 2) 조이스틱으로 스크롤 처리
     bool changed = false;
-    idx = getNavScroll(idx, total, changed);  // 이동 발생 시 changed == true
+    idx = getNavScroll(idx, total, changed);
 
     // 3) 조이스틱이 움직이지 않았을 때만 논블로킹 키패드 입력 처리
     char k = 0;
@@ -479,30 +688,36 @@ void menuUsers() {
       k = getNavKeyNB();  // 논블로킹: 키가 있으면 반환, 없으면 0
     }
 
-    if      (k == 'C') break;                       // 뒤로 가기
-    else if (k == 'A') idx = (idx == 1 ? total : idx - 1);       // 이전
-    else if (k == 'B') idx = idx % total + 1;  // 다음
+    if      (k == 'C') break;  // 뒤로 가기
+    else if (k == 'A') idx = (idx == 1 ? total : idx - 1);
+    else if (k == 'B') idx = idx % total + 1;
 
     // — 현재 사용자 삭제 ('*') —
     else if (k == '*') {
       lcd.clear(); lcd.print("Delete it?");
       lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
-      // 삭제 후 화면 갱신
-      char confirm = getNavKey();
+      char confirm = getNavKey();  // 블로킹: 1/2 대기
       if (confirm == '1') {
         SD.remove(String(SD_USERS_FOLDER) + "/" + getUserFileAt(idx));
         total = countUsersOnSD();
-        if (!total) break;
-        idx = min(idx, total);
-        prevIdx = -1;       // 화면 갱신 강제
+        if (!total) {
+          lcd.clear(); lcd.print("No Users"); delay(1000);
+          return;
+        }
+        idx = constrain(idx, 1, total);
+        prevIdx = -1;  // 화면 갱신 강제
+      } else if (confirm == '2') {
+        // 삭제 취소: 목록 화면으로 복귀
+        prevIdx = -1;
       }
     }
 
     // — 전체 사용자 삭제 ('D') —
     else if (k == 'D') {
-      lcd.clear(); lcd.print("Delete it?");
+      lcd.clear(); lcd.print("Reset all?");
       lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
-      if (getNavKeyNB() == '1') {
+      char confirm = getNavKey();  // 블로킹: 1/2 대기
+      if (confirm == '1') {
         File dir = SD.open(SD_USERS_FOLDER);
         while (true) {
           File f = dir.openNextFile();
@@ -511,7 +726,11 @@ void menuUsers() {
           f.close();
         }
         dir.close();
-        break;
+        lcd.clear(); lcd.print("No Users"); delay(1000);
+        return;
+      } else if (confirm == '2') {
+        // 초기화 취소: 목록 화면으로 복귀
+        prevIdx = -1;
       }
     }
 
@@ -537,10 +756,8 @@ void menuCommute() {
       lcd.clear();
       lcd.print(String(fIdx) + "/" + String(totalF));
       lcd.setCursor(0,1);
-      String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 파일명 가져오기
-      String date = fn.substring(0,4) + "/"     // 연도 (0,1,2,3)
-                    + fn.substring(4,6) + "/"   // 월   (4,5)
-                    + fn.substring(6,8);        // 일   (6,7)
+      String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 파일명
+      String date = fn.substring(0,4) + "/" + fn.substring(4,6) + "/" + fn.substring(6,8);
       lcd.print(date);
       prevFIdx = fIdx;
     }
@@ -551,32 +768,37 @@ void menuCommute() {
 
     // 3) 조이스틱 안 움직일 때만 논블로킹 키패드 처리
     if (!changed) {
-      char k = getNavKeyNB();  // 논블로킹: 키가 있으면 반환, 없으면 0
+      char k = getNavKeyNB();
+      if      (k == 'C') return;
+      else if (k == 'A') fIdx = (fIdx == 1 ? totalF : fIdx - 1);
+      else if (k == 'B') fIdx = fIdx % totalF + 1;
 
-      if      (k == 'C') return;                        // 뒤로
-      else if (k == 'A') fIdx = (fIdx == 1 ? totalF : fIdx - 1); // 이전
-      else if (k == 'B') fIdx = fIdx % totalF + 1;      // 다음
-
-      // — 현재 날짜의 로그 파일 삭제 ('*') —
+      // — 현재 날짜 로그 삭제 ('*') —
       else if (k == '*') {
-        lcd.clear(); lcd.print("Delete it?");
+        lcd.clear(); lcd.print("Delete?");
         lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
-        char confirm = getNavKey();                    // 블로킹: 1/2 대기
+        char confirm = getNavKey();
         if (confirm == '1') {
-          String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 인덱스 조회
+          String fn = getCommuteFileAt_Desc(fIdx);
           SD.remove(String(SD_COMMUTE_LOG_FOLDER) + "/" + fn);
           totalF = countCommuteLogs();
-          if (!totalF) return;
-          fIdx = min(fIdx, totalF);
-          prevFIdx = -1;  // 화면 갱신 강제
+          if (!totalF) {
+            lcd.clear(); lcd.print("No Logs"); delay(1000);
+            return;
+          }
+          fIdx = constrain(fIdx, 1, totalF);
+          prevFIdx = -1;
+        } else if (confirm == '2') {
+          // 삭제 취소: 날짜 목록 화면으로 복귀
+          prevFIdx = -1;
         }
       }
 
       // — 전체 로그 초기화 ('D') —
       else if (k == 'D') {
-        lcd.clear(); lcd.print("Delete it?");
+        lcd.clear(); lcd.print("Reset all?");
         lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
-        char confirm = getNavKey();                    // 블로킹: 1/2 대기
+        char confirm = getNavKey();
         if (confirm == '1') {
           File dir = SD.open(SD_COMMUTE_LOG_FOLDER);
           while (true) {
@@ -586,120 +808,266 @@ void menuCommute() {
             f.close();
           }
           dir.close();
+          lcd.clear(); lcd.print("No Logs"); delay(1000);
           return;
+        } else if (confirm == '2') {
+          // 초기화 취소: 날짜 목록 화면으로 복귀
+          prevFIdx = -1;
         }
       }
 
-      // — 날짜별 로그 항목 탐색 ('#') —
+      // — 로그 항목 탐색 ('#') —
       else if (k == '#') {
-        String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 인덱스 조회
+        String fn = getCommuteFileAt_Desc(fIdx);
         String path = String(SD_COMMUTE_LOG_FOLDER) + "/" + fn;
         int totalE = countLogEntries(path);
         if (!totalE) {
-          lcd.clear(); lcd.print("No Entries");
-          delay(1500);
-          prevFIdx = -1;  // 상위 화면 갱신 강제
+          lcd.clear(); lcd.print("No Entries"); delay(1000);
+          prevFIdx = -1;
           continue;
         }
-
-        int eIdx = 1;      // 항목 인덱스
-        int prevEIdx = -1; // 이전 항목 인덱스 기억
-
+        int eIdx = 1, prevEIdx = -1;
         while (true) {
-          // — 로그 항목 화면 갱신 —
           if (eIdx != prevEIdx) {
             lcd.clear();
             String line = getLogLine(path, eIdx);
             String time = line.substring(1,9);
             int p = line.indexOf("ID: ");
-            String id = (p >= 0 ? line.substring(p+4, p+12) : "");
-            lcd.print(String(eIdx) + "/" + String(totalE) + " " + time);
-            lcd.setCursor(0,1);
-            lcd.print("ID:" + id);
+            String id = (p>=0? line.substring(p+4,p+12):"");
+            lcd.print(String(eIdx)+"/"+String(totalE)+" " + time);
+            lcd.setCursor(0,1); lcd.print("ID:"+id);
             prevEIdx = eIdx;
           }
-
-          // 4) 조이스틱으로 항목 스크롤
           bool subChanged = false;
           eIdx = getNavScroll(eIdx, totalE, subChanged);
-
-          // 5) 조이스틱 안 움직일 때만 키패드 처리
           if (!subChanged) {
             char kk = getNavKeyNB();
-            if      (kk == 'C') break;                          // 돌아가기
-            else if (kk == 'A') eIdx = (eIdx == 1 ? totalE : eIdx - 1);  // 이전
-            else if (kk == 'B') eIdx = eIdx % totalE + 1;      // 다음
-
-            // 해당 항목 삭제 ('*')
-            else if (kk == '*') {
+            if (kk=='C') break;
+            else if (kk=='A') eIdx = (eIdx==1? totalE: eIdx-1);
+            else if (kk=='B') eIdx = eIdx % totalE + 1;
+            else if (kk=='*') {
               lcd.clear(); lcd.print("Delete it?");
               lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
-              char confirm = getNavKey();                    // 블로킹: 1/2 대기
-              if (confirm == '1') {
+              char c2 = getNavKey();
+              if (c2=='1') {
                 deleteLogEntry(path, eIdx);
                 totalE = countLogEntries(path);
                 if (!totalE) break;
-                eIdx = min(eIdx, totalE);
-                prevEIdx = -1;  // 화면 갱신 강제
+                eIdx = constrain(eIdx,1,totalE);
+                prevEIdx = -1;
+              } else if (c2=='2') {
+                prevEIdx = -1;
               }
             }
-
-            // 날짜 파일 자체 삭제 ('D')
-            else if (kk == 'D') {
-              lcd.clear(); lcd.print("Delete it?");
+            else if (kk=='D') {
+              lcd.clear(); lcd.print("Reset all?");
               lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
-              char confirm = getNavKey();                    // 블로킹: 1/2 대기
-              if (confirm == '1') {
+              char c2 = getNavKey();
+              if (c2=='1') {
                 SD.remove(path);
                 break;
+              } else if (c2=='2') {
+                prevEIdx = -1;
               }
             }
           }
-
           delay(20);
         }
-
-        // 6) 날짜 목록 갱신
         totalF = countCommuteLogs();
         if (!totalF) return;
-        fIdx = min(fIdx, totalF);
-        prevFIdx = -1;  // 화면 갱신 강제
+        fIdx = constrain(fIdx, 1, totalF);
+        prevFIdx = -1;
       }
     }
-
-    delay(20);  // 민감도 조절
+    delay(20);
   }
 }
 
+// 관리자 메뉴 5번 – 밝기 및 볼륨 조절 기능 제공
+void menuSetting() {
+  int sel = 1, prevSel = -1;
+  lcd.clear();
+  lcd.setCursor(0,0);  lcd.print("...");
+  loadSettings();
+  while (true) {
+    // 1) 화면 갱신
+    if (sel != prevSel) {
+      lcd.clear();
+      lcd.setCursor(0,0);  lcd.print("1/1");
+      lcd.setCursor(0,1);  lcd.print("1:Bright 2:Vol");
+      prevSel = sel;
+    }
+
+    // 2) 조이스틱 스크롤
+    bool changed = false;
+    sel = getNavScroll(sel, 2, changed);
+
+    // 3) 조이스틱이 움직이지 않을 때만 키패드 처리
+    if (!changed) {
+      char k = getNavKeyNB();
+      if (k == 'C') {
+        saveSettings();  // 저장 후 나가기
+        break;
+      }
+      else if (k == '1') {
+        // Bright 메뉴 진입 → LED만 깜빡임 시작
+        encoderPos = 0;              // ISR 누적값 초기화
+        int lastShownB = brightness;
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print("Bright:");
+        lcd.setCursor(8,0);
+        if      (brightness == 0)  lcd.print("OFF");
+        else if (brightness == 30) lcd.print("MAX");
+        else                       lcd.print(brightness);
+
+        triggerLedAndBuzzer(true, false);
+
+        while (true) {
+          updateLedAndBuzzer();  // 비차단으로 LED 상태 유지
+
+          // ISR에서 누적된 회전량을 기반으로 밝기 조절 (방향 반전 적용)
+          noInterrupts();
+          int delta = -encoderPos;   // ← 방향 반전
+          encoderPos = 0;
+          interrupts();
+          if (delta != 0) {
+            brightness = constrain(brightness + delta, 0, 30);
+            lcd.setCursor(8,0);
+            lcd.print("   ");
+            lcd.setCursor(8,0);
+            if      (brightness == 0)  lcd.print("OFF");
+            else if (brightness == 30) lcd.print("MAX");
+            else                       lcd.print(brightness);
+
+            // 감마 보정 재계산
+            float norm = float(brightness) / 30.0;
+            float adj  = pow(norm, 2.0);
+            nbDutyOn    = int(adj * 80.0 + 10.0);
+            nbDutyOff   = 100 - nbDutyOn;
+            if (nbLedOnState) nbLedInterval = nbDutyOn;
+          }
+
+          // C키로 메뉴 탈출…
+          if (getNavKeyNB() == 'C') {
+            nbLedEnable = false;
+            nbBuzzEnable = false;
+            digitalWrite(LATCH_PIN, LOW);
+            shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0);
+            digitalWrite(LATCH_PIN, HIGH);
+            prevSel = -1;
+            break;
+          }
+          delay(20);
+        }
+      }
+      else if (k == '2') {
+        // Vol 메뉴 진입 → 부저만 울림 시작
+        encoderPos = 0;              // ISR 누적값 초기화
+        int lastShownV = volumeLevel;
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print("Vol: ");
+        lcd.setCursor(5,0);
+        if      (volumeLevel == 0)  lcd.print("MUTE");
+        else if (volumeLevel == 30) lcd.print("MAX");
+        else                        lcd.print(volumeLevel);
+
+        triggerLedAndBuzzer(false, true);
+
+        while (true) {
+          updateLedAndBuzzer();  // 비차단으로 부저 상태 유지
+
+          // ISR에서 누적된 회전량을 기반으로 볼륨 조절 (방향 반전 적용)
+          noInterrupts();
+          int delta = -encoderPos;   // ← 방향 반전
+          encoderPos = 0;
+          interrupts();
+          if (delta != 0) {
+            volumeLevel = constrain(volumeLevel + delta, 0, 30);
+            lcd.setCursor(5,0);
+            lcd.print("    ");
+            lcd.setCursor(5,0);
+            if      (volumeLevel == 0)  lcd.print("MUTE");
+            else if (volumeLevel == 30) lcd.print("MAX");
+            else                        lcd.print(volumeLevel);
+          }
+
+          // C키로 메뉴 탈출
+          if (getNavKeyNB() == 'C') {
+            nbLedEnable = false;
+            nbBuzzEnable = false;
+            noTone(BUZZER_PIN);
+            prevSel = -1;
+            break;
+          }
+          delay(20);
+        }
+      }
+    }
+    delay(20);
+  }
+}
 
 // RFID 태그가 관리자 사번과 일치할 경우 실행되는 관리자 모드 메뉴
-// 1: 사용자 조회 및 삭제, 2: 출퇴근 로그 관리, 3/4: 향후 확장용 (사람 감지/화재 감지)
+// 1: 사용자 조회 및 삭제, 2: 출퇴근 로그 관리, 3/4: 향후 확장용 (사람 감지/화재 감지), 5: 세팅
 void adminMenu() {
-  while (true) {
-    lcd.clear();
-    lcd.print("1:USERS 2:COMMUTE");      // 상단 메뉴 표시
-    lcd.setCursor(0,1);
-    lcd.print("3:PEOPLE 4:FIRE");        // 하단 메뉴 표시
+  int page = 1;
+  int prevPage = -1;
 
-    char m = getKeypad();
-    if (m == 'C') {
-      // 'C' 입력 시 관리자 메뉴 종료 → 시스템 대기 상태로 복귀
-      lcd.clear(); lcd.print("Ready");
-      delay(500);
-      return;
+  while (true) {
+    // 화면 갱신
+    if (page != prevPage) {
+      lcd.clear();
+      lcd.setCursor(0,0);  lcd.print(String(page) + "/3");
+      lcd.setCursor(0,1);
+      if      (page == 1) lcd.print("1:Users 2:Commut");
+      else if (page == 2) lcd.print("3:People 4:Fire");
+      else                lcd.print("5:Setting");
+      prevPage = page;
     }
-    else if (m == '1') menuUsers();      // 사용자 관리 메뉴 진입
-    else if (m == '2') menuCommute();    // 출퇴근 로그 메뉴 진입
-    // '3'과 '4'는 현재 구현 없음 (무반응)
-    delay(200);
+
+    // 1) 조이스틱 탐색
+    bool changed = false;
+    page = getNavScroll(page, 3, changed);
+
+    // 2) 조이스틱이 움직이지 않을 때만 키패드 처리
+    if (!changed) {
+      char k = getNavKeyNB();
+      if (k == 'C') {
+        lcd.clear(); lcd.print("Ready"); delay(500);
+        return;
+      }
+      else if (k == 'A') page = (page == 1 ? 3 : page - 1);  // 이전 페이지
+      else if (k == 'B') page = (page == 3 ? 1 : page + 1);  // 다음 페이지
+      else if (k == '1') {
+        menuUsers();
+        prevPage = -1;  // 복귀 시 화면 갱신
+      }
+      else if (k == '2') {
+        menuCommute();
+        prevPage = -1;
+      }
+      else if (k == '3') {
+        // menuPeople();
+        prevPage = -1;
+      }
+      else if (k == '4') {
+        // menuFire();
+        prevPage = -1;
+      }
+      else if (k == '5') {
+        menuSetting();
+        prevPage = -1;
+      }
+    }
   }
 }
 
 // —————— setup & loop ——————
+
 // 시스템 시작 시 초기 설정을 수행하는 함수
 void setup() {
   Serial.begin(9600);        // 시리얼 디버깅용
-  
+  loadSettings();
   Wire.begin();              // I2C 시작
   lcd.init(); lcd.backlight(); // LCD 초기화 및 백라이트 켜기
 
@@ -711,11 +1079,11 @@ void setup() {
   if (!Rtc.GetIsRunning())        Rtc.SetIsRunning(true);         // RTC 시작
 
   // RFID 설정
+  pinMode(RST_PIN, OUTPUT);        // RST 핀 출력 모드
+  digitalWrite(RST_PIN, HIGH);     // 시작하자마자 활성화
   SPI.begin();
   rfid.PCD_Init();
   rfid.PCD_AntennaOn();
-  pinMode(RST_PIN, OUTPUT);  // RFID RST 핀 출력으로 설정
-  digitalWrite(RST_PIN, LOW); // 처음에는 꺼둠
 
   // 키패드 핀 설정
   for (int i = 0; i < 4; i++) {
@@ -745,6 +1113,26 @@ void setup() {
   delay(1000);
   lcd.clear(); lcd.print("Ready");    // 시스템 대기 상태 표시
 
+  // 로터리 엔코더 설정
+  pinMode(ROTARY_CLK, INPUT_PULLUP);
+  pinMode(ROTARY_DT,  INPUT_PULLUP);
+  lastState = (digitalRead(ROTARY_DT)<<1) | digitalRead(ROTARY_CLK);  // 초기 상태 저장
+  attachInterrupt(digitalPinToInterrupt(ROTARY_CLK), onEncoderChange, CHANGE);  // 두 핀 모두 상태 변화 인터럽트 등록
+  attachInterrupt(digitalPinToInterrupt(ROTARY_DT),  onEncoderChange, CHANGE);
+
+  // 시프트 레지스터 설정
+  pinMode(DATA_PIN, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
+
+  // LED 출력 클리어
+  digitalWrite(LATCH_PIN, LOW);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0);
+  digitalWrite(LATCH_PIN, HIGH);
+
+  // 부저 설정
+  pinMode(BUZZER_PIN, OUTPUT);
+
   // 활동 상태로 두고 타이머 초기화
   systemActive = true;
   activeStart = millis();
@@ -753,7 +1141,6 @@ void setup() {
 // 시스템 메인 루프 – RFID 태그 감지 및 행동 수행
 void loop() {
   unsigned long now = millis();
-
   // IR 센서가 장애물을 감지하거나 택트 스위치가 눌릴 때 시스템을 활성화함
   if (digitalRead(IR_SENSOR_PIN) == LOW || digitalRead(WAKE_BUTTON_PIN) == LOW) { 
     if (!systemActive) {
@@ -855,4 +1242,3 @@ void loop() {
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 }
-
