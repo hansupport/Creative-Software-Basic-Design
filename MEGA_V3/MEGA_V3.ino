@@ -6,9 +6,15 @@
 #include <RtcDS1302.h>           // RTC DS1302 라이브러리
 #include <SD.h>                  // SD 카드 라이브러리
 
+// —————— 전역 변수 ——————
+bool systemActive = false;           // 시스템 동작 상태
+unsigned long activeStart = 0;       // 마지막 활성화 시각
+const unsigned long activeTimeout = 10000;  // 10초 동작 지속 시간
+
 // —————— 핀 정의 ——————
-#define SS_PIN      15           // RFID SS (SDA)
 #define RST_PIN     14           // RFID RST 핀
+#define SS_PIN      15           // RFID SS (SDA)
+#define IR_SENSOR_PIN 16         // IR 장애물 감지 센서 핀
 
 // 키패드 행(Row)과 열(Col) 핀 정의
 const uint8_t rowPins[4] = {5,4,3,2};
@@ -23,6 +29,9 @@ const uint8_t colPins[4] = {6,7,8,9};
 #define RTC_RST_PIN 10
 #define RTC_CLK_PIN 11
 #define RTC_DAT_PIN 12
+
+// 택트 스위치 핀 정의
+#define WAKE_BUTTON_PIN 17
 
 // 조이스틱 핀 정의
 #define SW 13                           // 조이스틱 클릭 스위치 핀                       
@@ -77,6 +86,7 @@ char getKeypad() {
           char k = keys[r][c];
           while (digitalRead(colPins[c])==LOW);  // 키가 떼질 때까지 대기
           delay(50);  // 짧은 대기 후 반환
+          activeStart = millis();    // 키패드 입력 시 타이머 리셋
           return k;
         }
       }
@@ -123,6 +133,7 @@ int getNavScroll(int current, int total, bool &updated) {
 
   // 방향에 따라 인덱스 변경
   if (updated) {
+    activeStart = millis();  // 스크롤 시 타이머 리셋
     if (dir == 1) return current % total + 1;                 // 다음 항목으로 이동
     else return (current == 1 ? total : current - 1);         // 이전 항목으로 이동
   }
@@ -143,6 +154,7 @@ char getNavKeyNB() {
         char k = keys[r][c];
         while (digitalRead(colPins[c]) == LOW);
         delay(50);
+        activeStart = millis();    // 키패드 입력 시 타이머 리셋
         return k;
       }
     }
@@ -354,33 +366,85 @@ void registerOnSD(const String &uid, const String &num) {
 }
 
 // 출퇴근 로그를 날짜별 파일에 시간, ID, UID를 함께 기록
+// 출퇴근 로그를 날짜별 파일에 시간, ID, UID를 함께 기록 (logCommute 전체)
 void logCommute(const String &id, const String &uid) {
   RtcDateTime now = Rtc.GetDateTime();
 
   // 날짜 기반 파일명 생성: LOG1/YYYYMMDD.TXT
   char fn[25];
-  sprintf(fn, "LOG1/%04d%02d%02d.TXT", now.Year(), now.Month(), now.Day());
+  sprintf(fn, "LOG1/%04d%02d%02d.TXT",
+          now.Year(), now.Month(), now.Day());
 
   // 현재 시간 형식: [HH:MM:SS]
   char ts[12];
-  sprintf(ts, "[%02d:%02d:%02d]", now.Hour(), now.Minute(), now.Second());
+  sprintf(ts, "[%02d:%02d:%02d]",
+          now.Hour(), now.Minute(), now.Second());
 
-  digitalWrite(SS_PIN, HIGH);     // RFID 비활성화
-  digitalWrite(SD_CS_PIN, LOW);   // SD카드 활성화
+  digitalWrite(SS_PIN, HIGH);    // RFID 비활성화
+  digitalWrite(SD_CS_PIN, LOW);  // SD카드 활성화
 
-  File f = SD.open(fn, FILE_WRITE);  // 해당 날짜 로그 파일 열기
-  if (f) {
-    f.print(ts);          // 시간 기록
-    f.print(" ID: ");     // ID 앞 태그
-    f.print(id);          // 사용자 ID
-    f.print(" UID: ");    // UID 앞 태그
-    f.println(uid);       // UID 기록
-    f.close();
+  // 기존 로그 읽기
+  String oldContent = "";
+  File oldFile = SD.open(fn);
+  if (oldFile) {
+    while (oldFile.available()) {
+      oldContent += oldFile.readStringUntil('\n') + "\n";
+    }
+    oldFile.close();
+  }
+
+  // 파일 새로 쓰기 (최신 로그를 맨 위에)
+  SD.remove(fn);  // 기존 파일 삭제
+  File newFile = SD.open(fn, FILE_WRITE);
+  if (newFile) {
+    newFile.print(ts);          // 시간 기록
+    newFile.print(" ID: ");     // ID 앞 태그
+    newFile.print(id);          // 사용자 ID
+    newFile.print(" UID: ");    // UID 앞 태그
+    newFile.println(uid);       // UID 기록
+    newFile.print(oldContent);  // 기존 로그 덧붙이기
+    newFile.close();
   } else {
     Serial.println("WRITE ERROR");  // 실패 시 시리얼 출력
   }
 
   digitalWrite(SD_CS_PIN, HIGH);  // SD카드 비활성화
+}
+
+
+// 날짜 로그 파일을 최신순으로 가져오는 함수
+String getCommuteFileAt_Desc(int idx) {
+  char prevFile[13] = "";  // 이전에 찾은 파일명을 저장 (초기에는 빈 문자열)
+
+  // 원하는 인덱스만큼 반복 (최신부터 차례로 찾아감)
+  for (int i = 0; i < idx; i++) {
+    File dir = SD.open(SD_COMMUTE_LOG_FOLDER);  // 로그 폴더 열기
+    char best[13] = "";  // 이번 루프에서 찾을 가장 최신 파일명을 저장할 변수
+
+    // 폴더 내 파일들을 순회
+    while (true) {
+      File f = dir.openNextFile();  // 다음 파일 열기
+      if (!f) break;                // 없으면 반복 종료
+      const char* name = f.name();  // 파일명 가져오기
+
+      if (prevFile[0] == '\0') {
+        // 첫 번째 루프인 경우 → 전체 중 가장 큰(최신) 파일을 찾음
+        if (strcmp(name, best) > 0)
+          strcpy(best, name);
+      } else {
+        // 두 번째 루프부터는 prevFile보다 작은 이름 중 가장 큰 것을 찾음
+        if (strcmp(name, prevFile) < 0 && strcmp(name, best) > 0)
+          strcpy(best, name);
+      }
+
+      f.close();  // 파일 닫기
+    }
+
+    dir.close();             // 디렉토리 닫기
+    strcpy(prevFile, best);  // 이번에 찾은 best 파일명을 prevFile에 저장
+  }
+
+  return String(prevFile);  // idx번째 최신 파일명을 반환
 }
 
 // — 관리자 메뉴 & 서브메뉴 — 
@@ -468,13 +532,15 @@ void menuCommute() {
   int prevFIdx = -1;   // 이전 날짜 인덱스 기억
 
   while (true) {
-    // — 날짜 목록 표시 —
+    // 1) 날짜 목록 표시
     if (fIdx != prevFIdx) {
       lcd.clear();
       lcd.print(String(fIdx) + "/" + String(totalF));
       lcd.setCursor(0,1);
-      String fn = getCommuteFileAt(fIdx);  // 매번 최신 날짜 파일명 가져오기
-      String date = fn.substring(0,4) + "/" + fn.substring(4,6) + "/" + fn.substring(6,8);
+      String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 파일명 가져오기
+      String date = fn.substring(0,4) + "/"     // 연도 (0,1,2,3)
+                    + fn.substring(4,6) + "/"   // 월   (4,5)
+                    + fn.substring(6,8);        // 일   (6,7)
       lcd.print(date);
       prevFIdx = fIdx;
     }
@@ -497,7 +563,7 @@ void menuCommute() {
         lcd.setCursor(0,1); lcd.print("1:Yes 2:No");
         char confirm = getNavKey();                    // 블로킹: 1/2 대기
         if (confirm == '1') {
-          String fn = getCommuteFileAt(fIdx);
+          String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 인덱스 조회
           SD.remove(String(SD_COMMUTE_LOG_FOLDER) + "/" + fn);
           totalF = countCommuteLogs();
           if (!totalF) return;
@@ -526,7 +592,7 @@ void menuCommute() {
 
       // — 날짜별 로그 항목 탐색 ('#') —
       else if (k == '#') {
-        String fn = getCommuteFileAt(fIdx);
+        String fn = getCommuteFileAt_Desc(fIdx);  // 최신순 인덱스 조회
         String path = String(SD_COMMUTE_LOG_FOLDER) + "/" + fn;
         int totalE = countLogEntries(path);
         if (!totalE) {
@@ -605,6 +671,7 @@ void menuCommute() {
   }
 }
 
+
 // RFID 태그가 관리자 사번과 일치할 경우 실행되는 관리자 모드 메뉴
 // 1: 사용자 조회 및 삭제, 2: 출퇴근 로그 관리, 3/4: 향후 확장용 (사람 감지/화재 감지)
 void adminMenu() {
@@ -647,6 +714,8 @@ void setup() {
   SPI.begin();
   rfid.PCD_Init();
   rfid.PCD_AntennaOn();
+  pinMode(RST_PIN, OUTPUT);  // RFID RST 핀 출력으로 설정
+  digitalWrite(RST_PIN, LOW); // 처음에는 꺼둠
 
   // 키패드 핀 설정
   for (int i = 0; i < 4; i++) {
@@ -665,15 +734,62 @@ void setup() {
     lcd.clear(); lcd.print("SD init FAIL");
     while (true);                     // SD 초기화 실패 시 멈춤
   }
+  
+  // IR 센서 설정
+  pinMode(IR_SENSOR_PIN, INPUT);
+
+  // 택트 스위치 설정
+  pinMode(WAKE_BUTTON_PIN, INPUT_PULLUP);  // 내부 풀업 활성화
 
   lcd.clear(); lcd.print("System Ready");
   delay(1000);
   lcd.clear(); lcd.print("Ready");    // 시스템 대기 상태 표시
+
+  // 활동 상태로 두고 타이머 초기화
+  systemActive = true;
+  activeStart = millis();
 }
 
 // 시스템 메인 루프 – RFID 태그 감지 및 행동 수행
 void loop() {
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+  unsigned long now = millis();
+
+  // IR 센서가 장애물을 감지하거나 택트 스위치가 눌릴 때 시스템을 활성화함
+  if (digitalRead(IR_SENSOR_PIN) == LOW || digitalRead(WAKE_BUTTON_PIN) == LOW) { 
+    if (!systemActive) {
+      systemActive = true;
+      activeStart = now;
+      // RFID 모듈 ON
+      digitalWrite(RST_PIN, HIGH);
+      delay(50);
+      rfid.PCD_Init();
+      rfid.PCD_AntennaOn();
+      // LCD ON
+      lcd.backlight(); lcd.clear(); lcd.print("Ready");
+    }
+  }
+
+  // 시스템이 비활성화 상태이면 RFID, LCD, 조이스틱은 작동하지 않음
+  if (!systemActive) return;
+
+  // 시스템 활성화 유지 시간 초과 시 자동 비활성화
+  if (now - activeStart >= activeTimeout) {
+    systemActive = false;
+    // LCD OFF
+    lcd.clear();
+    lcd.noBacklight();
+
+    // RFID 모듈 OFF
+    rfid.PCD_AntennaOff();
+    digitalWrite(RST_PIN, LOW);
+    return;
+  }
+
+  // RFID 태그가 감지되지 않으면 나머지 루프 무시
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    getNavKeyNB();  // 키패드 논블로킹 감지: 입력이 있으면 타이머 리셋됨
+    return;
+  }
 
   // UID 문자열 생성
   String tag;
@@ -704,11 +820,13 @@ void loop() {
 
     if (userID == adminCode) {
       adminMenu();                        // 관리자 메뉴 진입
+      activeStart = millis();             // 관리자 메뉴 종료 후 타이머 리셋
     } else {
       lcd.setCursor(0, 0); lcd.print("ID:" + userID);  // 사용자 사번 출력
       displayTime();                                  // 시간 표시
       logCommute(userID, tag);                        // 출퇴근 로그 기록
       delay(2000);
+      activeStart = millis();                         // 사용자 활동 후 타이머 리셋
     }
   } else {
     // 등록되지 않은 사용자 → 등록 절차
@@ -723,6 +841,7 @@ void loop() {
         registerOnSD(tag, num);    // 사용자 등록
         lcd.clear(); lcd.print("Reged:" + num);
         delay(2000);
+        activeStart = millis();    // 등록 후 타이머 리셋
         break;
       }
       lcd.clear(); lcd.print("Retry (8 digits)");
@@ -736,3 +855,4 @@ void loop() {
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 }
+
