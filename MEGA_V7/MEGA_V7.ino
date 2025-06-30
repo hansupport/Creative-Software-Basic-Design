@@ -1,4 +1,5 @@
 // —————— 라이브러리 불러오기 ——————
+#define IR_USE_TIMER3             // IR 리모컨 타이머 수정 
 #include <Wire.h>                 // I2C 통신용
 #include <LiquidCrystal_I2C.h>    // I2C LCD 제어용
 #include <SPI.h>                  // SPI 통신용 (RFID, SD)
@@ -8,7 +9,7 @@
 #include <IRremote.h>             // IR 리모컨 라이브러리
 #include <OneWire.h>              // 1-Wire 통신
 #include <DallasTemperature.h>    // DS18B20 온도 센서
-#include <toneAC.h>               // ToneAC2: Timer2 기반
+#include <toneAC.h>               // ToneAC
 #include <MPU6050.h>              // mpu6050 가속도 센서
 
 // —————— 핀 정의 ——————
@@ -171,7 +172,7 @@ const float        TEMP_THRESHOLD     = 40.0;      // °C
 const int          LIGHT_THRESHOLD    = 50;        // 아날로그 값
 const int          FLAME_THRESHOLD    = 200;       // 아날로그 값
 const unsigned long HOLD_DURATION     = 5000;      // 5초 유지 (ms)
-const unsigned long SENSOR_INTERVAL   = 1000;      // 1초 간격 (ms)
+const unsigned long SENSOR_INTERVAL   = 2000;      // 2초 간격 (ms)
 
 // 개별 센서 상태 플래그, 타이머
 bool          tempFlag    = false;
@@ -197,7 +198,7 @@ String pinBuffer = "";                      // 누적된 PIN
 
 // 인체 감지용 임계값·유지시간
 const float   angleThreshold    = 20.0;      // 기울기 임계 (°)
-const int     distanceThreshold = 50;        // 초음파 거리 임계 (cm)
+const int     distanceThreshold = 100;        // 초음파 거리 임계 (cm)
 const unsigned long HOLD_DURATION_HUMAN      = 5000; // 센서 5초 유지
 const unsigned long sensorInterval = 1000;          // 1초 (인체 감지 주기)
 
@@ -798,7 +799,6 @@ void updateLedAndBuzzer() {
         nbPrevBuzzMillis = now;
         if (nbBuzzOnState) {
           noToneAC();
-          irrecv.enableIRIn();
           nbBuzzOnState  = false;
           nbToneStep     = 1 - nbToneStep;
           nbBuzzInterval = BUZZER_OFF_TIME;
@@ -812,9 +812,22 @@ void updateLedAndBuzzer() {
     } else {
       // volumeLevel == 0 일 때 부저 완전 정지
       noToneAC();
-      irrecv.enableIRIn();
     }
   }
+}
+
+// 초록 켜기
+void setGreen() {
+  digitalWrite(RGB_PIN_R, LOW);
+  digitalWrite(RGB_PIN_G, HIGH);
+  digitalWrite(RGB_PIN_B, LOW);
+}
+
+// 꺼짐
+void setOff() {
+  digitalWrite(RGB_PIN_R, LOW);
+  digitalWrite(RGB_PIN_G, LOW);
+  digitalWrite(RGB_PIN_B, LOW);
 }
 
 // 로터리 엔코더 디바운스 함수
@@ -1068,7 +1081,6 @@ void processAdmin() {
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
     digitalWrite(LATCH_PIN, HIGH);
     noToneAC();
-    irrecv.enableIRIn();
     fireState = false;
   }
 
@@ -1078,7 +1090,6 @@ void processAdmin() {
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
     digitalWrite(LATCH_PIN, HIGH);
     noToneAC();
-    irrecv.enableIRIn();
     humanAlertState = false;
   }
   
@@ -1105,12 +1116,12 @@ void processAdmin() {
       // PIN 입력 완료
       pinInputActive = false;
       if (pinBuffer == adminPW) {
+        Serial1.write('0'); 
         // 주간 모드 전환 전 LED·부저 즉시 끄기
         digitalWrite(LATCH_PIN, LOW);
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
         noToneAC();
-        irrecv.enableIRIn();
         fireState = false;
         humanAlertState = false;
 
@@ -1163,7 +1174,6 @@ void processAdmin() {
           shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
           digitalWrite(LATCH_PIN, HIGH);
           noToneAC();
-          irrecv.enableIRIn();
           fireState = false;
           humanAlertState = false;
 
@@ -1319,12 +1329,12 @@ void processAdmin() {
       else if (c == '#') {
         // ‘#’ 입력 시 PIN 확인
         if (irBuffer == adminPW) {
+          Serial1.write('0'); 
           // 주간 모드 전환 전 LED·부저 즉시 끄기
           digitalWrite(LATCH_PIN, LOW);
           shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
           digitalWrite(LATCH_PIN, HIGH);
           noToneAC();
-          irrecv.enableIRIn();
           fireState = false;
           humanAlertState = false;
 
@@ -1420,6 +1430,10 @@ void menuUsers() {
       } else if (confirm == '2') {
         // 삭제 취소: 목록 화면으로 복귀
         prevIdx = -1;
+      } else if (confirm == 'C') {
+        // 뒤로가기(C) 누르면 즉시 빠져나감
+        prevIdx = -1;
+        return;
       }
     }
 
@@ -1442,7 +1456,10 @@ void menuUsers() {
       } else if (confirm == '2') {
         // 초기화 취소: 목록 화면으로 복귀
         prevIdx = -1;
-      }
+      } else if (confirm == 'C') { 
+          prevIdx = -1;
+          return; 
+        }
     }
 
     delay(20);  // 민감도 조절
@@ -1502,9 +1519,15 @@ void menuCommute() {
           }
           fIdx = constrain(fIdx, 1, totalF);
           prevFIdx = -1;
-        } else if (confirm == '2') {
+        }
+        else if (confirm == '2') {
           // 삭제 취소: 날짜 목록 화면으로 복귀
           prevFIdx = -1;
+        }
+        else if (confirm == 'C') {
+          // 뒤로가기(C) 누르면 즉시 빠져나감
+          prevFIdx = -1;
+          return;
         }
       }
 
@@ -1653,6 +1676,10 @@ void menuHUMAN() {
         } else if (confirm == '2') {
           // 삭제 취소 → 목록 화면으로 복귀
           prevFIdx = -1;
+        } else if (confirm == 'C') {
+          // 뒤로가기(C) 누르면 즉시 빠져나감
+          prevFIdx = -1;
+          return;
         }
       }
 
@@ -1965,7 +1992,6 @@ bool menuSetting() {
             nbLedEnable = false;
             nbBuzzEnable = false;
             noToneAC();
-            irrecv.enableIRIn();
             prevPage = -1;
             break;
           }
@@ -2286,7 +2312,6 @@ void handleNightMode() {
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
         noToneAC();
-        irrecv.enableIRIn();
         fireState = false;
       }
     }
@@ -2305,9 +2330,22 @@ void handleNightMode() {
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
         noToneAC();
-        irrecv.enableIRIn();
         humanAlertState = false;
       }
+    }
+
+    // ─── (X) 블루투스에서 '0' 수신 시 Serial1으로 '1' 전송 ───
+    if (Serial2.available()) {
+      char c = Serial2.read();
+      // CR/LF 필터링
+      if (c == '\r' || c == '\n') { /* 무시 */ }
+      else if (c == '0') {
+        Serial1.write('1');   // TX1으로 '1' 전송
+        // Optional: 디버깅용 메시지
+        Serial.println("NightMode: received '0', sent '1' on TX1");
+      }
+      // 남은 버퍼 비우기
+      while (Serial2.available()) Serial2.read();
     }
 
     // ─── (C) 1초마다 센서 판정 (화재/인체 알림이 아닐 때만 실행) ───
@@ -2444,21 +2482,27 @@ void handleNightMode() {
 
       // ==== 화재 상태 진입 ====
       if ((tempAlert || lightAlert || flameAlert) && !fireState) {
-        fireState = true;
-        fireTime  = now;
-        triggerLedAndBuzzer(true, true);  // 화재 경보
-        logEvent(3, "FIRE", "");          // SD 카드 기록
-        continue;
+        if (fireDetectMode != 2) {         // 디버그 모드면 경보 실행 안 함
+          fireState = true;
+          fireTime  = now;
+          Serial1.write('1');               // 순찰 지시
+          triggerLedAndBuzzer(true, true);  // 화재 경보
+          logEvent(3, "FIRE", "");          // SD 카드 기록
+          continue;
+        }
       }
 
       // ==== 인체 상태 진입 ====
       int otherCount = humanCount - (tiltFlag ? 1 : 0);
       if ((tiltFlag && humanCount > 0) || (otherCount >= 2)) {
+        if (humanDetectMode != 2) {       // 디버그 모드면 경보 실행 안 함
         humanAlertState = true;
         humanAlertTime = now;
-        triggerLedAndBuzzer(true, true);
+        Serial1.write('1');               // 순찰 시작
+        triggerLedAndBuzzer(true, true);  // 인체 경보
         logEvent(2, "HUMAN", "");
         continue;  // 즉시 인체 알림 모드로 진입
+        }
       }
     }
 
@@ -2478,6 +2522,7 @@ void handleNightMode() {
 // 시스템 시작 시 초기 설정을 수행하는 함수
 void setup() {
   Serial.begin(9600);         // 시리얼 디버깅용
+  Serial1.begin(9600);        // TX1 출력
   Wire.begin();               // I2C 시작
   lcd.init(); lcd.backlight(); // LCD 초기화 및 백라이트 켜기
   lcd.clear(); lcd.print("System Ready");
@@ -2542,6 +2587,11 @@ void setup() {
   pinMode(DATA_PIN, OUTPUT);
   pinMode(LATCH_PIN, OUTPUT);
   pinMode(CLOCK_PIN, OUTPUT);
+
+  // RGB LED 설정
+  pinMode(RGB_PIN_R, OUTPUT);
+  pinMode(RGB_PIN_G, OUTPUT);
+  pinMode(RGB_PIN_B, OUTPUT);
 
   // LED 출력 클리어
   digitalWrite(LATCH_PIN, LOW);
