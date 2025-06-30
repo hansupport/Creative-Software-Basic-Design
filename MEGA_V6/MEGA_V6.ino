@@ -8,7 +8,8 @@
 #include <IRremote.h>             // IR 리모컨 라이브러리
 #include <OneWire.h>              // 1-Wire 통신
 #include <DallasTemperature.h>    // DS18B20 온도 센서
-#include <toneAC.h>              // ToneAC2: Timer2 기반
+#include <toneAC.h>               // ToneAC2: Timer2 기반
+#include <MPU6050.h>              // mpu6050 가속도 센서
 
 // —————— 핀 정의 ——————
 
@@ -77,6 +78,22 @@ const uint8_t colPins[4] = {30, 31, 32, 33};   // C1~C4
 #define FLAME1_PIN     A15    // 불꽃 센서1
 #define FLAME2_PIN     A10    // 불꽃 센서2
 
+// 초음파 센서 핀 정의
+#define TRIG1            44
+#define ECHO1            45
+#define TRIG2            41
+#define ECHO2            40
+
+// 충격 센서 핀 정의
+#define SHOCK_PIN        38
+
+// 사운드 감지 센서 핀 정의
+#define SOUND_SENSOR_PIN A14
+
+// PIR 센서 핀 정의
+#define PIR1_PIN         25
+#define PIR2_PIN         42
+
 // —————— 전역 변수 ——————
 // 조이스틱
 int joyY;                              // 현재 Y축 아날로그 값
@@ -91,7 +108,7 @@ const int joyIntervalFast = 150;       // 빠른 속도 스크롤 간격 (ms)
 // SD카드 폴더 경로 설정
 const char *SD_USERS_FOLDER       = "USERS";  // 사용자 정보 폴더
 const char *SD_COMMUTE_LOG_FOLDER = "LOG1";   // 출퇴근 로그 폴더
-const char *SD_PEOPLE_LOG_FOLDER = "LOG2";    // 사람 감지 로그 폴더
+const char *SD_HUMAN_LOG_FOLDER = "LOG2";    // 사람 감지 로그 폴더
 const char *SD_FIRE_LOG_FOLDER = "LOG3";      // 화재 감지 로그 폴더
 const char *SD_SETTING_FOLDER = "SET";         // 세팅 폴더
 
@@ -164,7 +181,7 @@ unsigned long lightTime   = 0;
 bool          flameFlag   = false;
 unsigned long flameTime   = 0;
 
-// 화재 전체 상태, 타이머
+// 화재 감지 전체 상태, 타이머
 bool          fireState   = false;
 unsigned long fireTime    = 0;
 
@@ -177,6 +194,32 @@ unsigned long adminStart = 0;               // Admin? 메뉴 진입 시각
 const unsigned long ADMIN_TIMEOUT = 20000;  // 20초 제한
 bool pinInputActive = false;                // PIN 입력 상태
 String pinBuffer = "";                      // 누적된 PIN
+
+// 인체 감지용 임계값·유지시간
+const float   angleThreshold    = 20.0;      // 기울기 임계 (°)
+const int     distanceThreshold = 50;        // 초음파 거리 임계 (cm)
+const unsigned long HOLD_DURATION_HUMAN      = 5000; // 센서 5초 유지
+const unsigned long sensorInterval = 1000;          // 1초 (인체 감지 주기)
+
+// 인체 감지용 플래그·타이머
+unsigned long lastSensorMillis = 0;
+
+// 인체 감지 전체 상태, 타이머
+bool humanAlertState = false;
+unsigned long humanAlertTime = 0;
+
+// 기울기, 충격, 사운드, pir, 초음파 감지 플래그·타이머
+unsigned long tiltTime   = 0, shockTime   = 0, soundTime = 0;
+unsigned long pir1Time   = 0, pir2Time    = 0;
+unsigned long us1Time    = 0, us2Time     = 0;
+
+bool tiltFlag   = false, shockFlag   = false, soundFlag = false;
+bool pir1Flag   = false, pir2Flag    = false;
+bool us1Flag    = false, us2Flag     = false;
+
+// 0: 꺼짐, 1: 켜짐, 2: 디버그 모드
+int fireDetectMode = 1;   // 화재 감지 모드
+int humanDetectMode = 1;  // 인체 감지 모드
 
 // 룩업 테이블: 인덱스 = (lastState<<2)|newState
 const int8_t QUAD_TABLE[16] = {
@@ -195,6 +238,7 @@ IRrecv irrecv(IR_RECV_PIN);                                 // IR 리모컨 수�
 decode_results irCode;                                      // 디코딩된 IR 코드를 저장할 구조체
 OneWire oneWire(ONE_WIRE_BUS);                              // 1-Wire
 DallasTemperature sensors(&oneWire);                        // DS18B20
+MPU6050 mpu;                                                // MPU6050 mpu
 
 // 키패드 키 배열 정의
 char keys[4][4] = {
@@ -440,7 +484,7 @@ String getIDAt(int idx) {
 int countLogs(int type) {
   const char* folder;
   if (type == 1)       folder = SD_COMMUTE_LOG_FOLDER;  // "LOG1"
-  else if (type == 2)  folder = SD_PEOPLE_LOG_FOLDER;   // "LOG2"
+  else if (type == 2)  folder = SD_HUMAN_LOG_FOLDER;   // "LOG2"
   else if (type == 3)  folder = SD_FIRE_LOG_FOLDER;     // "LOG3"
   else                 folder = SD_COMMUTE_LOG_FOLDER;  // 기본: LOG1
   File dir = SD.open(folder);
@@ -533,7 +577,7 @@ void logEvent(int type, const String &id, const String &uid) {
 
   const char* folder;
   if (type == 1)       folder = SD_COMMUTE_LOG_FOLDER;  // "LOG1"
-  else if (type == 2)  folder = SD_PEOPLE_LOG_FOLDER;   // "LOG2"
+  else if (type == 2)  folder = SD_HUMAN_LOG_FOLDER;   // "LOG2"
   else if (type == 3)  folder = SD_FIRE_LOG_FOLDER;     // "LOG3"
   else                 folder = SD_COMMUTE_LOG_FOLDER;  // 기본: LOG1
   
@@ -581,7 +625,7 @@ String getEventFileAt_Desc(int type, int idx) {
 
   const char* folder;
   if (type == 1)       folder = SD_COMMUTE_LOG_FOLDER;  // "LOG1"
-  else if (type == 2)  folder = SD_PEOPLE_LOG_FOLDER;   // "LOG2"
+  else if (type == 2)  folder = SD_HUMAN_LOG_FOLDER;   // "LOG2"
   else if (type == 3)  folder = SD_FIRE_LOG_FOLDER;     // "LOG3"
   else                 folder = SD_COMMUTE_LOG_FOLDER;  // 기본: LOG1
 
@@ -817,41 +861,227 @@ bool readWakeButton() {
   return wakeLastStable;
 }
 
-// —————— 화재 감지 ——————
-bool holdState(bool cond, bool& flag, unsigned long& t0,
-               const char* label, unsigned long duration = HOLD_DURATION) {
+// —————— 화재 감지 및 인체 감지 ——————
+
+// 화재 감지
+bool holdStateFire(bool cond, bool& flag, unsigned long& t0,
+               const char* label, unsigned long duration = HOLD_DURATION, bool debug = false) {
+  unsigned long now = millis();
+  int sensorValue = 0;
+  int threshold = 0;
+  String valueStr;
+
+  // (1) 센서 값과 임계값을 저장 (디버그용 출력에 사용)
+  if (strstr(label, "온도")) {
+    // 온도는 float이므로 별도 출력
+    float tempC = sensors.getTempCByIndex(0);
+    sensorValue = (int)tempC;
+    threshold = (int)TEMP_THRESHOLD;
+    valueStr = String(sensorValue);
+  } else if (strstr(label, "조도")) {
+    int lightVal = analogRead(LIGHT_PIN);
+    sensorValue = lightVal;
+    threshold = LIGHT_THRESHOLD;
+    valueStr = String(sensorValue);
+  } else if (strstr(label, "불꽃")) {
+    int f1 = analogRead(FLAME1_PIN);
+    int f2 = analogRead(FLAME2_PIN);
+    threshold = FLAME_THRESHOLD;
+    valueStr = "센서1=" + String(f1) + ", 센서2=" + String(f2);
+    sensorValue = min(f1, f2);  // 조건 평가에 사용
+  }
+
+  // (2) 조건이 처음 참이 된 순간
   if (cond && !flag) {
     flag = true;
-    t0 = millis();
-    Serial.print(label); Serial.println(" 감지 ✅ 타이머 시작");
+    t0 = now;
+    if (debug) {
+      // 유지 중(최초 감지)
+      Serial.print(label);
+      Serial.print(" 유지 중… ✅ 값: ");
+      Serial.print(valueStr);
+      Serial.print(" (Threshold: ");
+      Serial.print(threshold);
+      Serial.println(")");
+    }
+    return false;  // 아직 duration 경과 전
   }
+
+  // (3) 이미 flag가 참이고 duration 경과 전
   if (flag) {
-    if (millis() - t0 < duration) {
-      Serial.print(label); Serial.println(" 유지 중…");
-      return false;  // 아직 HOLD_DURATION 미만
+    unsigned long elapsed = now - t0;
+    if (elapsed < duration) {
+      if (debug) {
+        Serial.print(label);
+        Serial.print(" 유지 중… (");
+        Serial.print(elapsed / 1000.0, 2);
+        Serial.print("s) ✅ 값: ");
+        Serial.print(valueStr);
+        Serial.print(" (Threshold: ");
+        Serial.print(threshold);
+        Serial.println(")");
+      }
+      return false;
     } else {
-      Serial.print(label); Serial.println(" 5초 유지 완료! 🔥");
+      // (4) duration 경과하여 최종 감지 상태
       flag = false;
-      return true;   // 5초 이상 유지됨
+      if (debug) {
+        Serial.print(label);
+        Serial.print(" 5초 유지 완료! 🔥 ✅ 값: ");
+        Serial.print(valueStr);
+        Serial.print(" (Threshold: ");
+        Serial.print(threshold);
+        Serial.println(")");
+      }
+      return true;
     }
   }
-  Serial.print(label); Serial.println(" 없음");
+
+  // (5) cond가 거짓이면 "없음" 출력
+  if (debug) {
+    Serial.print(label);
+    Serial.print(" 없음 ❌ 값: ");
+    Serial.print(valueStr);
+    Serial.print(" (Threshold: ");
+    Serial.print(threshold);
+    Serial.println(")");
+  }
   return false;
+}
+
+// 인체 감지
+// duration: 0으로 설정하면 바로 한 번 감지됨으로 리턴
+bool holdStateHuman(bool cond, bool& flag, unsigned long& t0,
+                    const char* label, unsigned long duration = HOLD_DURATION_HUMAN, bool debug = false) {
+  unsigned long now = millis();
+  float elapsedS = (now - t0) / 1000.0;
+  String valueStr;
+  String thresholdStr;
+
+  // (1) 센서 값과 임계값 문자열 생성 (디버그 출력용)
+  if (strstr(label, "기울기")) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    float pitch = atan2(ax/16384.0, sqrt(sq(ay/16384.0) + sq(az/16384.0))) * 180/PI;
+    float roll  = atan2(ay/16384.0, sqrt(sq(ax/16384.0) + sq(az/16384.0))) * 180/PI;
+    valueStr = "Pitch=" + String(pitch, 2) + "°, Roll=" + String(roll, 2) + "°";
+    thresholdStr = String(angleThreshold) + "°";
+  } else if (strstr(label, "초음파1")) {
+    float d1 = getDistance(TRIG1, ECHO1);
+    valueStr = String(d1, 2) + "cm";
+    thresholdStr = String(distanceThreshold) + "cm";
+  } else if (strstr(label, "초음파2")) {
+    float d2 = getDistance(TRIG2, ECHO2);
+    valueStr = String(d2, 2) + "cm";
+    thresholdStr = String(distanceThreshold) + "cm";
+  } else if (strstr(label, "충격")) {
+    int shockVal = digitalRead(SHOCK_PIN);
+    valueStr = String(shockVal);
+    thresholdStr = "HIGH=감지";
+  } else if (strstr(label, "소리")) {
+    int soundVal = analogRead(SOUND_SENSOR_PIN);
+    valueStr = String(soundVal);
+    thresholdStr = "100";
+  } else if (strstr(label, "PIR1")) {
+    int pir1Val = digitalRead(PIR1_PIN);
+    valueStr = String(pir1Val);
+    thresholdStr = "HIGH=감지";
+  } else if (strstr(label, "PIR2")) {
+    int pir2Val = digitalRead(PIR2_PIN);
+    valueStr = String(pir2Val);
+    thresholdStr = "HIGH=감지";
+  }
+
+  // (2) 조건이 처음 참이 된 순간
+  if (cond && !flag) {
+    flag = true;
+    t0 = now;
+    if (debug) {
+      Serial.print(label);
+      Serial.print(" 유지 중… ✅ 값: ");
+      Serial.print(valueStr);
+      Serial.print(" (Threshold: ");
+      Serial.print(thresholdStr);
+      Serial.println(")");
+    }
+    return true;  // 최초 감지 시 true 반환
+  }
+
+  // (3) 이미 flag가 참이고 duration 경과 전
+  if (flag) {
+    if (now - t0 < duration) {
+      if (debug) {
+        Serial.print(label);
+        Serial.print(" 유지 중… (");
+        Serial.print(elapsedS, 2);
+        Serial.print("s) ✅ 값: ");
+        Serial.print(valueStr);
+        Serial.print(" (Threshold: ");
+        Serial.print(thresholdStr);
+        Serial.println(")");
+      }
+      return true;
+    } else {
+      // (4) duration 경과하여 최종 감지 상태 해제
+      flag = false;
+      if (debug) {
+        Serial.print(label);
+        Serial.print(" 5초 유지 완료! 🔍 ✅ 값: ");
+        Serial.print(valueStr);
+        Serial.print(" (Threshold: ");
+        Serial.print(thresholdStr);
+        Serial.println(")");
+      }
+      return false;
+    }
+  }
+
+  // (5) cond가 거짓이면 "없음" 출력
+  if (debug) {
+    Serial.print(label);
+    Serial.print(" 없음 ❌ 값: ");
+    Serial.print(valueStr);
+    Serial.print(" (Threshold: ");
+    Serial.print(thresholdStr);
+    Serial.println(")");
+  }
+  return false;
+}
+
+// 초음파 거리(cm) 측정
+float getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(20);
+  digitalWrite(trig, LOW);
+  long d = pulseIn(echo, HIGH, 30000);
+  return d ? d * 0.034 / 2 : -1;
 }
 
 // 택트 스위치, IR 논블로킹으로 동시 처리 
 void processAdmin() {
-  // 화재 알림 15초 경과 시 종료
   unsigned long now = millis();
+
+  // (A) 화재 알림 15초 경과 시 종료
   if (fireState && now - fireTime >= 15000UL) {
-    // LED·부저 즉시 끄기
+    // LED·부저 OFF
     digitalWrite(LATCH_PIN, LOW);
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
     digitalWrite(LATCH_PIN, HIGH);
     noToneAC();
     irrecv.enableIRIn();
-    fireState = false;          // 화재 상태 해제
+    fireState = false;
   }
+
+  // (B) 인체 알림 15초 경과 시 종료
+  if (humanAlertState && now - humanAlertTime >= 15000UL) {
+    digitalWrite(LATCH_PIN, LOW);
+    shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
+    digitalWrite(LATCH_PIN, HIGH);
+    noToneAC();
+    irrecv.enableIRIn();
+    humanAlertState = false;
+  }
+  
   // 1) PIN 입력 논블로킹 처리
   if (pinInputActive) {
     // 1-A) 논블로킹 키패드 입력
@@ -882,6 +1112,7 @@ void processAdmin() {
         noToneAC();
         irrecv.enableIRIn();
         fireState = false;
+        humanAlertState = false;
 
         // 주간 모드 전환
         isNightMode = false;
@@ -934,6 +1165,7 @@ void processAdmin() {
           noToneAC();
           irrecv.enableIRIn();
           fireState = false;
+          humanAlertState = false;
 
           // 주간 모드 전환
           isNightMode = false;
@@ -1094,6 +1326,7 @@ void processAdmin() {
           noToneAC();
           irrecv.enableIRIn();
           fireState = false;
+          humanAlertState = false;
 
           // 주간 모드 전환
           isNightMode = false;
@@ -1365,9 +1598,9 @@ void menuCommute() {
 }
 
 // 관리자 메뉴 3번 – 날짜별 인체 감지 로그 조회 및 삭제 기능 제공
-void menuPeople() {
+void menuHUMAN() {
   // 인체 감지 로그는 type == 2
-  const char* folder = SD_PEOPLE_LOG_FOLDER;
+  const char* folder = SD_HUMAN_LOG_FOLDER;
 
   int totalF = countLogs(2);  // 인체 감지 로그 파일 개수 확인
   if (!totalF) {
@@ -1462,7 +1695,7 @@ void menuPeople() {
             String line = getLogLine(path, eIdx);
             String time = line.substring(1,9);
             int p = line.indexOf("ID: ");
-            String id = (p>=0? line.substring(p+4,p+7):"");
+            String id = (p>=0? line.substring(p+4,p+9):"");
             lcd.print(String(eIdx)+"/"+String(totalE)+" " + time);
             lcd.setCursor(0,1); lcd.print(id);
             prevEIdx = eIdx;
@@ -1613,7 +1846,7 @@ void menuFire() {
   }
 }
 
-// 관리자 메뉴 5번 – 밝기 및 볼륨 조절 기능 제공
+// 관리자 메뉴 5번 – 밝기, 볼륨, 관리자 ID PW 수정, 야간모드 전환 기능 제공
 bool menuSetting() {
   int page = 1, prevPage = -1;
   lcd.clear();
@@ -1623,17 +1856,18 @@ bool menuSetting() {
     // 1) 화면 갱신
     if (page != prevPage) {
       lcd.clear();
-      lcd.setCursor(0,0);  lcd.print(String(page) + "/3");
+      lcd.setCursor(0,0);  lcd.print(String(page) + "/4");
       lcd.setCursor(0,1);
       if      (page == 1) lcd.print("1:Bright 2:Vol");
       else if (page == 2) lcd.print("3:AdminID 4:PW");
-      else                lcd.print("5:Mode");
+      else if (page == 3) lcd.print("5:fMode 6: hMode");
+      else                lcd.print("7:Night");
       prevPage = page;
     }
 
     // 2) 조이스틱 스크롤
     bool changed = false;
-    page = getNavScroll(page, 3, changed);
+    page = getNavScroll(page, 4, changed);
 
     // 3) 조이스틱이 움직이지 않을 때만 키패드 처리
     if (!changed) {
@@ -1642,8 +1876,8 @@ bool menuSetting() {
         saveSettings();  // 저장 후 나가기
         return false;
       }
-      else if (k == 'A') page = (page == 1 ? 3 : page - 1);  // 이전 페이지
-      else if (k == 'B') page = (page == 3 ? 1 : page + 1);  // 다음 페이지
+      else if (k == 'A') page = (page == 1 ? 4 : page - 1);  // 이전 페이지
+      else if (k == 'B') page = (page == 4 ? 1 : page + 1);  // 다음 페이지
       else if (k == '1') {
         // Bright 메뉴 진입 → LED만 깜빡임 시작
         encoderPos = 0;              // ISR 누적값 초기화
@@ -1781,7 +2015,132 @@ bool menuSetting() {
         }
         prevPage = -1;  // 메뉴 화면 갱신
       }
-      else if (k == '5'){
+      else if (k == '5') {
+        // 1) 사용자에게 Fire Mode 옵션 보여주기
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Fire Mode");
+        lcd.setCursor(0, 1);
+        lcd.print("1:ON 2:OFF 3:DBG");
+
+        // 블로킹으로 숫자 입력 대기
+        char choice = getNavKey();  
+
+        // 'C'를 누르면 뒤로 가기
+        if (choice == 'C') {
+          prevPage = -1;
+          continue;
+        }
+
+        // 2) 선택이 유효한 경우에만 "Change Mode?" 묻기
+        if (choice == '1' || choice == '2' || choice == '3') {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Change Mode?");
+          lcd.setCursor(0, 1);
+          lcd.print("1:Yes 2:No");
+
+          // 블로킹으로 Yes/No 입력 대기
+          char confirm = getNavKey();
+
+          // 'C'를 누르거나 2:No 면 아무 변경 없이 뒤로 가기
+          if (confirm == '1') {
+            if (choice == '1') {
+              fireDetectMode = 1;  // 켜짐
+            } else if (choice == '2') {
+              fireDetectMode = 0;  // 꺼짐
+            } else { 
+              fireDetectMode = 2;  // 디버그 모드
+            }
+          }
+        }
+        // FIRE Mode 화면 표시 부분
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("FIRE Mode:");
+
+        // fireDetectMode 값에 따라 ON/OFF/DBG 출력
+        lcd.setCursor(0, 1);
+        switch (fireDetectMode) {
+          case 0:
+            lcd.print("OFF");
+            break;
+          case 1:
+            lcd.print("ON");
+            break;
+          case 2:
+            lcd.print("DBG");
+            break;
+          default:
+            lcd.print("ERR");  // 예외 처리
+            break;
+        }
+        delay(1000);
+        prevPage = -1;
+      }
+      else if (k == '6') {
+        // 1) 사용자에게 HUMAN Mode 옵션 보여주기
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("HUMAN Mode");
+        lcd.setCursor(0, 1);
+        lcd.print("1:ON 2:OFF 3:DBG");
+
+        // 블로킹으로 숫자 입력 대기
+        char choice = getNavKey();  
+
+        // 'C'를 누르면 뒤로 가기
+        if (choice == 'C') {
+          prevPage = -1;
+          continue;
+        }
+
+        // 2) 선택이 유효한 경우에만 "Change Mode?" 묻기
+        if (choice == '1' || choice == '2' || choice == '3') {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Change Mode?");
+          lcd.setCursor(0, 1);
+          lcd.print("1:Yes 2:No");
+
+          // 블로킹으로 Yes/No 입력 대기
+          char confirm = getNavKey();
+
+          // 'C'를 누르거나 2:No 면 아무 변경 없이 뒤로 가기
+          if (confirm == '1') {
+            if (choice == '1') {
+              humanDetectMode = 1;  // 켜짐
+            } else if (choice == '2') {
+              humanDetectMode = 0;  // 꺼짐
+            } else { 
+              humanDetectMode = 2;  // 디버그 모드
+            }
+          }
+        }
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("HUMAN Mode:");
+
+        // humanDetectMode 값에 따라 ON/OFF/DBG 출력
+        lcd.setCursor(0, 1);
+        switch (humanDetectMode) {
+          case 0:
+            lcd.print("OFF");
+            break;
+          case 1:
+            lcd.print("ON");
+            break;
+          case 2:
+            lcd.print("DBG");
+            break;
+          default:
+            lcd.print("ERR");  // 예외 처리
+            break;
+        }
+        delay(1000);
+        prevPage = -1;
+      }
+      else if (k == '7'){
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Change Mode?");
@@ -1791,14 +2150,6 @@ bool menuSetting() {
         if (confirm == '1') {
           isNightMode = true; // 야간 모드로 전환
           nightModeInitialized = false;
-
-          // LCD 끄기
-          lcd.clear();
-          lcd.noBacklight();
-
-          // RFID 모듈 끄기
-          rfid.PCD_AntennaOff();
-          digitalWrite(RST_PIN, LOW);
 
           return true; // 관리자 모드에서 빠져나감
         } else {
@@ -1826,7 +2177,7 @@ void adminMenu() {
       lcd.setCursor(0,0);  lcd.print(String(page) + "/3");
       lcd.setCursor(0,1);
       if      (page == 1) lcd.print("1:Users 2:Commut");
-      else if (page == 2) lcd.print("3:People 4:Fire");
+      else if (page == 2) lcd.print("3:HUMAN 4:Fire");
       else                lcd.print("5:Setting");
       prevPage = page;
     }
@@ -1853,7 +2204,7 @@ void adminMenu() {
         prevPage = -1;
       }
       else if (k == '3') {
-        menuPeople();
+        menuHUMAN();
         prevPage = -1;
       }
       else if (k == '4') {
@@ -1881,6 +2232,11 @@ void handleNightMode() {
   // (1) 처음 진입 시: LCD 끄고, RFID 전원/안테나 끄기
   if (!nightModeInitialized) {
     lcd.clear();
+    lcd.setCursor(0, 0);    lcd.print("Night Mode");
+    lcd.setCursor(0, 1);    lcd.print("Standby ...");
+    delay(5000);
+
+    lcd.clear();
     lcd.noBacklight();
     // RFID 모듈 비활성화
     rfid.PCD_AntennaOff();
@@ -1900,9 +2256,13 @@ void handleNightMode() {
     lastSensorMillis = millis();
     adminStart       = millis();
     fireTime         = millis();
+    humanAlertTime   = millis();
 
     // 화재 상태 해제
     fireState = false;
+    // 인체 감지 상태 해제
+    humanAlertState = false;
+
     // 관리자 메뉴/핀 입력 상태 해제
     adminActive     = false;
     pinInputActive  = false;
@@ -1921,7 +2281,7 @@ void handleNightMode() {
         processAdmin();
         continue;
       } else {
-        // 15초 경과 → 알림 종료
+        // 15초 경과 → 화재 알림 종료
         digitalWrite(LATCH_PIN, LOW);
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
@@ -1931,45 +2291,178 @@ void handleNightMode() {
       }
     }
 
-    // ─── (B) 1초마다 센서 판정 (화재 상태가 아닐 때만 실행) ───
-    if (!fireState && (now - lastSensorMillis >= SENSOR_INTERVAL)) {
-      lastSensorMillis = now;
-
-      // 1) DS18B20 온도 판정
-      sensors.requestTemperatures();
-      float tempC = sensors.getTempCByIndex(0);
-      if (tempC == DEVICE_DISCONNECTED_C) tempC = -100;
-      bool tempCond  = (tempC >= TEMP_THRESHOLD);
-      bool tempAlert = holdState(tempCond, tempFlag, tempTime,
-                                 "🔥 화재(온도)", HOLD_DURATION);
-
-      // 2) 조도 판정
-      int lightVal = analogRead(LIGHT_PIN);
-      bool lightCond  = (lightVal <= LIGHT_THRESHOLD);
-      bool lightAlert = holdState(lightCond, lightFlag, lightTime,
-                                  "🔥 화재(조도)", HOLD_DURATION);
-
-      // 3) 불꽃 판정
-      int flame1 = analogRead(FLAME1_PIN);
-      int flame2 = analogRead(FLAME2_PIN);
-      bool flameCond  = (flame1 <= FLAME_THRESHOLD || flame2 <= FLAME_THRESHOLD);
-      bool flameAlert = holdState(flameCond, flameFlag, flameTime,
-                                  "🔥 화재(불꽃)", HOLD_DURATION);
-
-      // 4) 센서 중 하나라도 5초 유지되면 화재 상태 진입
-      if ((tempAlert || lightAlert || flameAlert) && !fireState) {
-        fireState = true;
-        fireTime  = now;
-        // LED+부저 경보 시작
-        triggerLedAndBuzzer(true, true);
-        // SD 카드에 화재 로그 기록
-        logEvent(3, "FIRE", "");
-        // 즉시 while 맨 위로 돌아가서 화재 알림 모드 유지
+    // ─── (B) 인체 알림 상태 처리 ───
+    if (humanAlertState) {
+      if (now - humanAlertTime < 15000UL) {
+        // 15초 동안 LED·부저만 업데이트 (인체 감지)
+        updateLedAndBuzzer();
+        // 택트 스위치&IR 입력 처리 함수 호출
+        processAdmin();
         continue;
+      } else {
+        // 15초 경과 → 인체 알림 종료
+        digitalWrite(LATCH_PIN, LOW);
+        shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
+        digitalWrite(LATCH_PIN, HIGH);
+        noToneAC();
+        irrecv.enableIRIn();
+        humanAlertState = false;
       }
     }
 
-    // ─── (C) 택트 스위치 & IR 리모컨 입력 논블로킹 처리 ───
+    // ─── (C) 1초마다 센서 판정 (화재/인체 알림이 아닐 때만 실행) ───
+    if (!fireState && !humanAlertState && (now - lastSensorMillis >= SENSOR_INTERVAL)) {
+      lastSensorMillis = now;
+
+      // 우선 인체 센서 모두 체크하여 출력
+      int humanCount = 0;
+      if (humanDetectMode != 0) {
+        // 1) 기울기 (MPU6050)
+        int16_t ax, ay, az;
+        mpu.getAcceleration(&ax, &ay, &az);
+        float pitch = atan2(ax/16384.0, sqrt(sq(ay/16384.0) + sq(az/16384.0))) * 180/PI;
+        float roll  = atan2(ay/16384.0, sqrt(sq(ax/16384.0) + sq(az/16384.0))) * 180/PI;
+        if (holdStateHuman(
+              abs(pitch) > angleThreshold || abs(roll) > angleThreshold,
+              tiltFlag, tiltTime, "🙂 기울기",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+        
+        // 2) 초음파1
+        float d1 = getDistance(TRIG1, ECHO1);
+        if (holdStateHuman(
+              d1 > 0 && d1 <= distanceThreshold,
+              us1Flag, us1Time, "🙂 초음파1",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+        
+        // 3) 초음파2
+        float d2 = getDistance(TRIG2, ECHO2);
+        if (holdStateHuman(
+              d2 > 0 && d2 <= distanceThreshold,
+              us2Flag, us2Time, "🙂 초음파2",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+
+        // 4) 충격 센서
+        if (holdStateHuman(
+              digitalRead(SHOCK_PIN) == HIGH,
+              shockFlag, shockTime, "🙂 충격",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+
+        // 5) 소리 센서
+        if (holdStateHuman(
+              analogRead(SOUND_SENSOR_PIN) > 100,
+              soundFlag, soundTime, "🙂 소리",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+
+        // 6) PIR 센서1
+        if (holdStateHuman(
+              digitalRead(PIR1_PIN) == HIGH,
+              pir1Flag, pir1Time, "🙂 PIR1",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+        // 7) PIR 센서2
+        if (holdStateHuman(
+              digitalRead(PIR2_PIN) == HIGH,
+              pir2Flag, pir2Time, "🙂 PIR2",
+              HOLD_DURATION_HUMAN,
+              (humanDetectMode == 2)
+            )) {
+          humanCount++;
+        }
+
+        if (humanDetectMode == 2) {
+          Serial.print("DEBUG 인체 감지용 센서 수 총합: ");
+          Serial.println(humanCount);
+        }
+      }
+
+      // 인체 출력 끝난 뒤 구분선
+      if (humanDetectMode == 2) {
+        Serial.println("=======================");
+      }
+
+      // 그다음 화재 센서 모두 체크하여 출력
+      bool tempAlert = false, lightAlert = false, flameAlert = false;
+      if (fireDetectMode != 0) {
+        // 1) DS18B20 온도 판정
+        sensors.requestTemperatures();
+        float tempC = sensors.getTempCByIndex(0);
+        if (tempC == DEVICE_DISCONNECTED_C) tempC = -100;
+        bool tempCond  = (tempC >= TEMP_THRESHOLD);
+        tempAlert = holdStateFire(
+          tempCond, tempFlag, tempTime,
+          "🔥 화재(온도)", HOLD_DURATION,
+          (fireDetectMode == 2)
+        );
+
+        // 2) 조도 판정
+        int lightVal = analogRead(LIGHT_PIN);
+        bool lightCond  = (lightVal <= LIGHT_THRESHOLD);
+        lightAlert = holdStateFire(
+          lightCond, lightFlag, lightTime,
+          "🔥 화재(조도)", HOLD_DURATION,
+          (fireDetectMode == 2)
+        );
+
+        // 3) 불꽃 판정
+        int flame1 = analogRead(FLAME1_PIN);
+        int flame2 = analogRead(FLAME2_PIN);
+        bool flameCond  = (flame1 <= FLAME_THRESHOLD || flame2 <= FLAME_THRESHOLD);
+        flameAlert = holdStateFire(
+          flameCond, flameFlag, flameTime,
+          "🔥 화재(불꽃)", HOLD_DURATION,
+          (fireDetectMode == 2)
+        );
+      }
+
+      // 인체와 화재 구분선 이후 출력 끝나면 빈 줄 추가
+      if (fireDetectMode == 2) {
+        Serial.println();
+      }
+
+      // ==== 화재 상태 진입 ====
+      if ((tempAlert || lightAlert || flameAlert) && !fireState) {
+        fireState = true;
+        fireTime  = now;
+        triggerLedAndBuzzer(true, true);  // 화재 경보
+        logEvent(3, "FIRE", "");          // SD 카드 기록
+        continue;
+      }
+
+      // ==== 인체 상태 진입 ====
+      int otherCount = humanCount - (tiltFlag ? 1 : 0);
+      if ((tiltFlag && humanCount > 0) || (otherCount >= 2)) {
+        humanAlertState = true;
+        humanAlertTime = now;
+        triggerLedAndBuzzer(true, true);
+        logEvent(2, "HUMAN", "");
+        continue;  // 즉시 인체 알림 모드로 진입
+      }
+    }
+
+    // ─── (D) 택트 스위치 & IR 리모컨 입력 논블로킹 처리 ───
     processAdmin();
 
     delay(20);
@@ -1979,6 +2472,7 @@ void handleNightMode() {
   nightModeInitialized = false;
 }
 
+
 // —————— setup & loop ——————
 
 // 시스템 시작 시 초기 설정을 수행하는 함수
@@ -1986,6 +2480,7 @@ void setup() {
   Serial.begin(9600);         // 시리얼 디버깅용
   Wire.begin();               // I2C 시작
   lcd.init(); lcd.backlight(); // LCD 초기화 및 백라이트 켜기
+  lcd.clear(); lcd.print("System Ready");
 
   // SD 카드 설정
   pinMode(SD_CS_PIN, OUTPUT);
@@ -1999,7 +2494,7 @@ void setup() {
   // SD 폴더들이 없으면 생성
   if (!SD.exists(SD_USERS_FOLDER)) SD.mkdir(SD_USERS_FOLDER);
   if (!SD.exists(SD_COMMUTE_LOG_FOLDER)) SD.mkdir(SD_COMMUTE_LOG_FOLDER);
-  if (!SD.exists(SD_PEOPLE_LOG_FOLDER))  SD.mkdir(SD_PEOPLE_LOG_FOLDER);
+  if (!SD.exists(SD_HUMAN_LOG_FOLDER))  SD.mkdir(SD_HUMAN_LOG_FOLDER);
   if (!SD.exists(SD_FIRE_LOG_FOLDER))    SD.mkdir(SD_FIRE_LOG_FOLDER);
   if (!SD.exists(SD_SETTING_FOLDER))    SD.mkdir(SD_SETTING_FOLDER);
 
@@ -2056,14 +2551,36 @@ void setup() {
   // DS18B20 센서 초기화
   sensors.begin();
 
-  // 초기 화재 상태 초기화
-  fireState = false;
+  // MPU6050 초기화
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 연결 실패!");
+    while (1);
+  }
+
+  // 초음파 센서
+  pinMode(TRIG1, OUTPUT);
+  pinMode(ECHO1, INPUT);
+  digitalWrite(TRIG1, LOW);
+  pinMode(TRIG2, OUTPUT);
+  pinMode(ECHO2, INPUT);
+  digitalWrite(TRIG2, LOW);
+
+  // 충격 센서
+  pinMode(SHOCK_PIN, INPUT);
+
+  // 사운드 센서
+  pinMode(SOUND_SENSOR_PIN, INPUT);
+
+  // PIR 센서
+  pinMode(PIR1_PIN, INPUT);
+  pinMode(PIR2_PIN, INPUT);
 
   // 활동 상태로 두고 타이머 초기화
   systemActive = true;
   activeStart = millis();
 
-  lcd.clear(); lcd.print("System Ready");
+  
   delay(1000);
   lcd.clear(); lcd.print("Ready");    // 시스템 대기 상태 표시
 }
