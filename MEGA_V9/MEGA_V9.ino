@@ -1,4 +1,5 @@
 // —————— 라이브러리 불러오기 ——————
+#define IR_USE_TIMER3             // IR 리모컨 타이머 수정 
 #include <Wire.h>                 // I2C 통신용
 #include <LiquidCrystal_I2C.h>    // I2C LCD 제어용
 #include <SPI.h>                  // SPI 통신용 (RFID, SD)
@@ -126,6 +127,18 @@ const unsigned long activeTimeout = 10000;  // 10초 동작 지속 시간
 int brightness;     // LED 밝기 (0–30)
 int volumeLevel;    // 부저 소리 (0–30)
 
+// 블루투스 수신 및 LED
+bool    blinkBlue    = false;      // 블루 LED 깜빡임 플래그
+unsigned long blinkLast   = 0;     // 마지막 깜빡임 타이밍
+const unsigned long blinkInterval = 500; // 깜빡임 간격(ms)
+bool    blueState     = false;     // LED on/off 상태
+char    lastCmd       = 0;         // 마지막에 받은 명령('1'~'5')
+unsigned long blinkStart = 0;      // 블루투스 깜빡임 시작 시각
+bool redOn = false;
+bool greenOn = false;
+unsigned long ledStartTime = 0;
+const unsigned long ledDuration = 1000;  // LED 지속 시간(ms)
+
 // 로터리 엔코더
 int lastClkState;   // 상태 저장
 
@@ -155,13 +168,6 @@ int  nbDutyOn, nbDutyOff;       // 감마 기반 ON/OFF 시간(ms)
 int  nbLedInterval;             // LED가 다음 전환까지 기다릴 시간
 int  nbBuzzInterval = 40;       // 부저가 다음 전환까지 기다릴 시간
 
-// 초록/빨간 불 비차단 제어용
-unsigned long ledStartTime = 0;
-bool redOn   = false;
-bool yellowOn = false;
-bool greenOn = false;
-const unsigned long ledDuration = 1000;
-
 // 리모컨으로 입력된 숫자를 문자열로 모을 버퍼
 String irBuffer = "";
 unsigned long lastIrMillis = 0;    // 마지막으로 IR 신호를 받은 시각
@@ -177,8 +183,8 @@ unsigned long wakeLastChangeTime = 0;  // RAW 값이 바뀐 시점 기록
 const float        TEMP_THRESHOLD     = 40.0;      // °C
 const int          LIGHT_THRESHOLD    = 50;        // 아날로그 값
 const int          FLAME_THRESHOLD    = 200;       // 아날로그 값
-const unsigned long HOLD_DURATION     = 5000;      // 5초 유지 (ms)
-const unsigned long SENSOR_INTERVAL   = 1000;      // 1초 간격 (ms)
+const unsigned long HOLD_DURATION     = 3000;      // 3초 유지 (ms)
+const unsigned long SENSOR_INTERVAL   = 2000;      // 2초 간격 (ms)
 
 // 개별 센서 상태 플래그, 타이머
 bool          tempFlag    = false;
@@ -204,7 +210,7 @@ String pinBuffer = "";                      // 누적된 PIN
 
 // 인체 감지용 임계값·유지시간
 const float   angleThreshold    = 20.0;      // 기울기 임계 (°)
-const int     distanceThreshold = 50;        // 초음파 거리 임계 (cm)
+const int     distanceThreshold = 100;        // 초음파 거리 임계 (cm)
 const unsigned long HOLD_DURATION_HUMAN      = 5000; // 센서 5초 유지
 const unsigned long sensorInterval = 1000;          // 1초 (인체 감지 주기)
 
@@ -805,7 +811,6 @@ void updateLedAndBuzzer() {
         nbPrevBuzzMillis = now;
         if (nbBuzzOnState) {
           noToneAC();
-          irrecv.enableIRIn();
           nbBuzzOnState  = false;
           nbToneStep     = 1 - nbToneStep;
           nbBuzzInterval = BUZZER_OFF_TIME;
@@ -819,22 +824,14 @@ void updateLedAndBuzzer() {
     } else {
       // volumeLevel == 0 일 때 부저 완전 정지
       noToneAC();
-      irrecv.enableIRIn();
     }
   }
 }
 
 // 빨강 켜기
 void setRed() {
-  digitalWrite(RGB_PIN_R, LOW);
-  digitalWrite(RGB_PIN_G, HIGH);
-  digitalWrite(RGB_PIN_B, LOW);
-}
-
-// 노랑 켜기
-void setYellow() {
   digitalWrite(RGB_PIN_R, HIGH);
-  digitalWrite(RGB_PIN_G, HIGH);
+  digitalWrite(RGB_PIN_G, LOW);
   digitalWrite(RGB_PIN_B, LOW);
 }
 
@@ -1103,7 +1100,6 @@ void processAdmin() {
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
     digitalWrite(LATCH_PIN, HIGH);
     noToneAC();
-    irrecv.enableIRIn();
     fireState = false;
   }
 
@@ -1113,7 +1109,6 @@ void processAdmin() {
     shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
     digitalWrite(LATCH_PIN, HIGH);
     noToneAC();
-    irrecv.enableIRIn();
     humanAlertState = false;
   }
   
@@ -1140,12 +1135,12 @@ void processAdmin() {
       // PIN 입력 완료
       pinInputActive = false;
       if (pinBuffer == adminPW) {
+        Serial1.write('0'); 
         // 주간 모드 전환 전 LED·부저 즉시 끄기
         digitalWrite(LATCH_PIN, LOW);
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
         noToneAC();
-        irrecv.enableIRIn();
         fireState = false;
         humanAlertState = false;
 
@@ -1198,7 +1193,6 @@ void processAdmin() {
           shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
           digitalWrite(LATCH_PIN, HIGH);
           noToneAC();
-          irrecv.enableIRIn();
           fireState = false;
           humanAlertState = false;
 
@@ -1354,12 +1348,12 @@ void processAdmin() {
       else if (c == '#') {
         // ‘#’ 입력 시 PIN 확인
         if (irBuffer == adminPW) {
+          Serial1.write('0'); 
           // 주간 모드 전환 전 LED·부저 즉시 끄기
           digitalWrite(LATCH_PIN, LOW);
           shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
           digitalWrite(LATCH_PIN, HIGH);
           noToneAC();
-          irrecv.enableIRIn();
           fireState = false;
           humanAlertState = false;
 
@@ -1455,6 +1449,10 @@ void menuUsers() {
       } else if (confirm == '2') {
         // 삭제 취소: 목록 화면으로 복귀
         prevIdx = -1;
+      } else if (confirm == 'C') {
+        // 뒤로가기(C) 누르면 즉시 빠져나감
+        prevIdx = -1;
+        return;
       }
     }
 
@@ -1477,7 +1475,10 @@ void menuUsers() {
       } else if (confirm == '2') {
         // 초기화 취소: 목록 화면으로 복귀
         prevIdx = -1;
-      }
+      } else if (confirm == 'C') { 
+          prevIdx = -1;
+          return; 
+        }
     }
 
     delay(20);  // 민감도 조절
@@ -1537,9 +1538,15 @@ void menuCommute() {
           }
           fIdx = constrain(fIdx, 1, totalF);
           prevFIdx = -1;
-        } else if (confirm == '2') {
+        }
+        else if (confirm == '2') {
           // 삭제 취소: 날짜 목록 화면으로 복귀
           prevFIdx = -1;
+        }
+        else if (confirm == 'C') {
+          // 뒤로가기(C) 누르면 즉시 빠져나감
+          prevFIdx = -1;
+          return;
         }
       }
 
@@ -1688,6 +1695,10 @@ void menuHUMAN() {
         } else if (confirm == '2') {
           // 삭제 취소 → 목록 화면으로 복귀
           prevFIdx = -1;
+        } else if (confirm == 'C') {
+          // 뒤로가기(C) 누르면 즉시 빠져나감
+          prevFIdx = -1;
+          return;
         }
       }
 
@@ -2000,7 +2011,6 @@ bool menuSetting() {
             nbLedEnable = false;
             nbBuzzEnable = false;
             noToneAC();
-            irrecv.enableIRIn();
             prevPage = -1;
             break;
           }
@@ -2321,7 +2331,6 @@ void handleNightMode() {
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
         noToneAC();
-        irrecv.enableIRIn();
         fireState = false;
       }
     }
@@ -2340,7 +2349,6 @@ void handleNightMode() {
         shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00);
         digitalWrite(LATCH_PIN, HIGH);
         noToneAC();
-        irrecv.enableIRIn();
         humanAlertState = false;
       }
     }
@@ -2479,23 +2487,27 @@ void handleNightMode() {
 
       // ==== 화재 상태 진입 ====
       if ((tempAlert || lightAlert || flameAlert) && !fireState) {
-        fireState = true;
-        fireTime  = now;
-        Serial1.write('1');               // 순찰 지시
-        triggerLedAndBuzzer(true, true);  // 화재 경보
-        logEvent(3, "FIRE", "");          // SD 카드 기록
-        continue;
+        if (fireDetectMode != 2) {         // 디버그 모드면 경보 실행 안 함
+          fireState = true;
+          fireTime  = now;
+          Serial1.write('1');               // 순찰 지시
+          triggerLedAndBuzzer(true, true);  // 화재 경보
+          logEvent(3, "FIRE", "");          // SD 카드 기록
+          continue;
+        }
       }
 
       // ==== 인체 상태 진입 ====
       int otherCount = humanCount - (tiltFlag ? 1 : 0);
       if ((tiltFlag && humanCount > 0) || (otherCount >= 2)) {
+        if (humanDetectMode != 2) {       // 디버그 모드면 경보 실행 안 함
         humanAlertState = true;
         humanAlertTime = now;
         Serial1.write('1');               // 순찰 시작
         triggerLedAndBuzzer(true, true);  // 인체 경보
         logEvent(2, "HUMAN", "");
         continue;  // 즉시 인체 알림 모드로 진입
+        }
       }
     }
 
@@ -2516,6 +2528,7 @@ void handleNightMode() {
 void setup() {
   Serial.begin(9600);         // 시리얼 디버깅용
   Serial1.begin(9600);        // TX1 출력
+  Serial2.begin(9600);        // RX2 입력
   Wire.begin();               // I2C 시작
   lcd.init(); lcd.backlight(); // LCD 초기화 및 백라이트 켜기
   lcd.clear(); lcd.print("System Ready");
@@ -2585,6 +2598,9 @@ void setup() {
   pinMode(RGB_PIN_R, OUTPUT);
   pinMode(RGB_PIN_G, OUTPUT);
   pinMode(RGB_PIN_B, OUTPUT);
+  digitalWrite(RGB_PIN_R, LOW);
+  digitalWrite(RGB_PIN_G, LOW);
+  digitalWrite(RGB_PIN_B, LOW);
 
   // LED 출력 클리어
   digitalWrite(LATCH_PIN, LOW);
@@ -2623,7 +2639,6 @@ void setup() {
   systemActive = true;
   activeStart = millis();
 
-  
   delay(1000);
   lcd.clear(); lcd.print("Ready");    // 시스템 대기 상태 표시
 }
@@ -2631,21 +2646,106 @@ void setup() {
 // 시스템 메인 루프 – RFID 태그 감지 및 행동 수행
 void loop() {
   unsigned long now = millis();
-
-  // 1초 지난 모든 상태불(빨강/노랑/초록) 끄기
-  if ((greenOn || redOn || yellowOn) && now - ledStartTime >= ledDuration) {
-    greenOn = redOn = yellowOn = false;
+  // 1) LED 자동 끄기
+  if ((redOn || greenOn) && now - ledStartTime >= ledDuration) {
+    redOn = greenOn = false;
     setOff();
   }
 
-  // 1) 야간 모드 진입 여부 판단
+  // 2) 야간 모드 진입 여부 판단
   if (isNightMode) {
     handleNightMode();
     return;  // handleNightMode() 내부에서 주간 모드로 전환 시 RFID를 켜고 systemActive=true로 설정했으므로,
             // 바로 이 아래부터 정상적으로 평소 루프를 타게 됩니다.
   }
 
-  // 2) 평상시 절전 타이머 재활성화 조건 (IR 센서 감지 or 택트 스위치)
+  // 3) 파란색 LED 깜빡임 지속 시간 수정
+  if (blinkBlue && now - blinkStart >= 30000UL) {
+    blinkBlue = false;
+    digitalWrite(RGB_PIN_B, LOW);  // LED 끔
+  }
+
+  // 4) 블루투스 수신 처리 (CR/LF 제거 + 버퍼 비우기)
+  if (Serial2.available()) {
+    char cmd;
+    // 받은 문자 중 유효한 명령 찾기
+    do {
+      cmd = Serial2.read();
+    } while ((cmd == '\r' || cmd == '\n') && Serial2.available());
+
+    // 버퍼에 남은 잔여문자(가능한 CR/LF) 비우기
+    while (Serial2.available()) Serial2.read();
+
+    // 유효 범위 확인
+    if (cmd >= '1' && cmd <= '5') {
+      lastCmd   = cmd;
+      blinkBlue = true;
+      blinkLast = now;
+      blueState = false;
+      blinkStart = now;         // 깜빡임 시작 시각 기록
+    }
+  }
+
+  // 블루 LED 깜빡임
+  if (blinkBlue) {
+    if (now - blinkLast >= blinkInterval) {
+      blinkLast = now;
+      blueState = !blueState;
+      // R/G 끄고 B만 토글
+      digitalWrite(RGB_PIN_R, LOW);
+      digitalWrite(RGB_PIN_G, LOW);
+      digitalWrite(RGB_PIN_B, blueState ? HIGH : LOW);
+    }
+  }
+
+  // 택트 스위치 누르면 메시지 5초 표시
+  if (digitalRead(WAKE_BUTTON_PIN) == LOW && lastCmd != 0) {
+    // LCD에 메시지 표시
+    lcd.backlight();
+    lcd.clear();
+    switch (lastCmd) {
+      case '1':
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Turn off heater");
+        break;
+      case '2':
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Turn off A/C");
+        break;
+      case '3':
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Low humidity");
+        break;
+      case '4':
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("High humidity");
+        break;
+      case '5':
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Raining");
+        lcd.setCursor(0, 1);
+        lcd.print("Close windows");
+        break;
+    }
+    delay(5000);
+
+    // 절전 모드 진입
+    systemActive = false;              
+    lcd.clear();                       
+    lcd.noBacklight();                 // LCD 백라이트 끔
+    rfid.PCD_AntennaOff();             // RFID 안테나 끔
+    digitalWrite(RST_PIN, LOW);        // RFID 리더 전원 OFF
+    lastCmd = 0;                       
+    blinkBlue = false;                 
+    digitalWrite(RGB_PIN_B, LOW);      // 블루 LED 끔
+  }
+
+  // 5) 평상시 절전 타이머 재활성화 조건 (IR 센서 감지 or 택트 스위치)
   if (digitalRead(IR_SENSOR_PIN) == LOW || readWakeButton() == LOW) {
     if (!systemActive) {
       systemActive = true;
@@ -2662,10 +2762,10 @@ void loop() {
     }
   }
 
-  // 3) 시스템 비활성화 상태라면 탈출
+  // 6) 시스템 비활성화 상태라면 탈출
   if (!systemActive) return;
 
-  // 4) 절전 타이머 초과 시 자동 비활성화
+  // 7) 절전 타이머 초과 시 자동 비활성화
   if (now - activeStart >= activeTimeout) {
     systemActive = false;
     // LCD OFF
@@ -2677,13 +2777,13 @@ void loop() {
     return;
   }
 
-  // 5) RFID 태그 검사
+  // 8) RFID 태그 검사
   if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
     getNavKeyNB(); // 키패드 논블로킹으로 타이머 리셋용
     return;
   }
 
-  // 6) UID 문자열 생성
+  // 9) UID 문자열 생성
   String tag;
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (rfid.uid.uidByte[i] < 0x10) tag += "0";
@@ -2693,7 +2793,7 @@ void loop() {
   tag.toUpperCase();
 
   String userFile = String(SD_USERS_FOLDER) + "/" + uidToName(tag) + ".txt";
-  
+
   lcd.clear();
   if (SD.exists(userFile)) {
     // 등록된 사용자 (ID 읽기)
@@ -2719,12 +2819,10 @@ void loop() {
       if (pw != adminPW) {
         lcd.clear();
         lcd.print("Wrong PW");
-
-        redOn = true;
-        ledStartTime = millis();
         setRed();
-        
-        delay(1000);
+        redOn = true;
+        ledStartTime = now;
+        delay(1500);
         lcd.clear();
         lcd.print("Ready");
         activeStart = millis();
@@ -2732,23 +2830,28 @@ void loop() {
         rfid.PCD_StopCrypto1();
         return;
       }
-      greenOn = true;
-      ledStartTime = millis();
-      setGreen();
-
-      adminMenu();
+      else {
+        setGreen();
+        greenOn = true;
+        ledStartTime = now;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("...");
+        delay(500);
+        setOff();
+        greenOn = false;
+        adminMenu();
+      }
     } else {
       // 일반 사용자 출퇴근 로그 기록
       lcd.setCursor(0, 0);
       lcd.print("ID:" + userID);
       displayTime();
       logEvent(1, userID, tag);
-
-      greenOn = true;
-      ledStartTime = millis();
       setGreen();
-
-      delay(1000);
+      greenOn = true;
+      ledStartTime = now;
+      delay(2000);
       activeStart = millis();
     }
   } else {
@@ -2758,39 +2861,30 @@ void loop() {
       if (num == "") {
         lcd.clear();
         lcd.print("Cancelled");
-        redOn = true;
-        ledStartTime = millis();
-        setRed();
-        delay(1000);
+        delay(1500);
         break;
       }
       num.trim();
       if (num.length() == 8) {
         registerOnSD(tag, num);
-
-        greenOn = true;
-        ledStartTime = millis();
         setGreen();
+        greenOn = true;
+        ledStartTime = now;
         lcd.clear();
         lcd.print("Reged:" + num);
-        delay(1000);
+        delay(2000);
         activeStart = millis();
         break;
       }
       lcd.clear();
       lcd.print("Retry (8 digits)");
-
-      yellowOn       = true;
-      ledStartTime   = millis();
-      setYellow();
-
-      delay(1000);
+      delay(1500);
       lcd.clear();
       lcd.print("Enter ID:");
     }
   }
 
-  // 7) 태그 종료 및 대기 상태 복귀
+  // 10) 태그 종료 및 대기 상태 복귀
   lcd.clear();
   lcd.print("Ready");
   rfid.PICC_HaltA();

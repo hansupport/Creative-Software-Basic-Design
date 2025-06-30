@@ -3,6 +3,76 @@
 모든 중요한 변경 사항은 이 문서에 기록됩니다.
 
 ---
+## [2.1] – 2025-06-22
+
+### MEGA_V9
+
+#### 추가
+- IR 리모컨 입력 안정화 (`IR_USE_TIMER3` 적용으로 타이머 충돌 방지)  
+- MPU6050 가속도·자이로 센서 통합으로 기울기 기반 인체 감지 기능 추가  
+- 논블로킹 경보 엔진 도입 (`triggerLedAndBuzzer()` / `updateLedAndBuzzer()` 상태 머신)  
+- 감지 유지 판별 유틸 함수 추가 (`holdStateFire()` 3초 유지, `holdStateHuman()` 5초 유지)  
+- 관리자 메뉴에서 화재·인체 감지 모드에 ON/OFF/DEBUG 옵션 확장  
+- IR 리모컨을 통한 관리자 PIN 입력 지원 (키패드와 동시 사용 가능)  
+
+#### 개선
+- 핀 정의 및 디바운스 일괄 정리 (키패드 D26–D33, 엔코더 D2–D3, 디바운스 5 ms)  
+- 관리자 인증 타임아웃 강화 (`ADMIN_TIMEOUT` 20 초, 타임아웃 시 LCD 백라이트·RFID 안테나 자동 OFF)  
+- SD 폴더 구조 상수화 및 설정 로직 리팩토링 (`USERS`, `LOG1`–`LOG3`, `SET` / `loadSettings()`·`saveSettings()` 개선)  
+
+#### 기타
+- `registerOnSD()` SD 쓰기 안정화 및 등록 완료 표시 개선  
+- 절전 모드 복귀 시 RFID 안테나 이중 초기화 문제 해결  
+- `logEvent()` 최신 로그를 맨 위에 기록하도록 버그 수정  
+
+
+### Charge_V2
+
+#### 추가
+- 실내/실외 DHT11 온·습도 센서 통합 (`DHT` 라이브러리 사용)  
+- LDR 조도 센서로 야간 판단 로직 추가 (`LDR_THRESHOLD`)  
+- 전압 센서 읽기 → 전압 레벨 매핑 → 7세그먼트 디스플레이 연동  
+- 수위 센서 임계치 기반 침수 알림 (`WATER_THRESHOLD`)  
+- 창문 리드 스위치 감지 → 야간 경고 전송  
+- PIR/IR 기반 인체 감지 (`OBSTACLE_PIN`) 시 7세그 + 부저 동시 제어  
+- 가변저항 값으로 부저 주파수 생성 (`POT_PIN` → 500–3000 Hz 매핑)  
+- HC-05 블루투스 통신 (`SoftwareSerial btSerial`) 및 `sendTX()` 함수  
+
+#### 개선
+- 7세그먼트 제어 유틸 함수 분리 (`showDigit()`, `showBlank()`)로 중복 제거  
+- 부저+디스플레이 동시 깜빡임 처리 함수 (`buzzToneWithDisplay()`) 추가  
+- 부저만 울리는 제어 함수 (`buzzTone()`) 도입  
+- 가변저항 주파수 연산 시 50 ms 단위 안정화 (`stablePot`, `lastPot`)  
+- 야간 감지 루프 진입 시 즉시 `return` 구조로 불필요 연산 최소화  
+
+#### 기타
+- 모든 핀 번호와 임계치를 상수로 정의하여 가독성·유지보수성 강화  
+- `delay()` 값 조정으로 루프 주기 균일화  
+- 중복 전송 방지 플래그 추가 (`tempAlerted`, `humLowAlerted`, `waterAlerted` 등)  
+
+
+### UNO_V2
+
+#### 추가
+- SoftwareSerial(A4→RX, A5→TX)로 외부 명령 수신 (`swSer`)  
+- 서보 스캔 루틴 도입: 0.5 초 간격으로 `angle` ±15° 반복 (`SERVO_INTERVAL`)  
+- “0”/“1” 명령으로 라인트레이싱 모드 토글 (`lineTracingEnabled`)  
+- 트래킹 센서 3축(좌·중·우) 아날로그 판별 → 흑/백 조합 기반 주행 모드 결정  
+- 비(白)연속 1 초 유지 시 탐색 로직 (`isSearching`, `whiteStartTime`)  
+- L298N 네 대의 모터 제어 함수 분리 (`moveForward()`, `turnLeft()` 등)  
+- 10 초 후 자동 모드 OFF (`TRACE_DURATION`)  
+
+#### 개선
+- 모드 전환 시 이전 모드와 비교하여 불필요한 `stopMotors()` 호출 제거 (단일 `delay(modeDelay)`)  
+- 속도 비율 변수 도입으로 전진·회전·후진 속도 조정 (`forwardSpeedControl`, `turnSpeedControl`, `reverseSpeedControl`)  
+- 서보 초기 복귀 각도(90°) 고정 관리 (`prevMovementMode` 및 복귀 분기)  
+- 디버그용 `Serial` 출력 통합 및 주기화 (`PRINT_INTERVAL`)  
+
+#### 기타
+- 모든 핀을 상수로 정의하여 매직 넘버 제거  
+- 루프 내부 복잡도 분리: 명령 수신 → 서보 스캔 → 센서 판별 → 모터 실행 흐름 명확화  
+- 검색 종료 시 서보 및 모터 강제 정지 로직 일원화  
+
 ## [2.0] - 2025-06-10
 
 ### 추가
