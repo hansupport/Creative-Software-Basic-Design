@@ -1,0 +1,55 @@
+# 1. 운영체제별 무시 파일들
+#################################
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# 2. Arduino 빌드 결과물
+#################################
+*.hex
+*.elf
+*.eep
+*.bin
+*.d
+*.o
+*.a
+*.map
+*.srec
+*.dep
+
+# 3. Arduino IDE, VS Code, PlatformIO 관련
+#################################
+# Arduino IDE 2.x 등에서 생성되는 빌드 폴더
+build/
+Build/
+.build/
+.cache/
+
+# PlatformIO 관련
+.pio/
+
+# VS Code 설정 파일
+.vscode/
+*.code-workspace
+
+# 4. 백업 및 임시 파일
+#################################
+*.bak
+*.tmp
+*.swp
+*.swo
+*.swn
+
+# 5. 보드/라이브러리 설정 (선택적 무시)
+#################################
+# 라이브러리 디렉토리를 버전관리 하지 않을 경우 사용
+# libraries/
+
+# 보드 하드웨어 설정 디렉토리
+hardware/
